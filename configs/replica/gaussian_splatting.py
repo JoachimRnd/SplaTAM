@@ -46,7 +46,7 @@ config = dict(
         eval_save_qual=True,
     ),
     data=dict(
-        basedir="./data/Replica",
+        basedir="../Datasets/Replica",
         gradslam_data_cfg="./configs/data/replica.yaml",
         sequence="room0",
         desired_image_height_init=170,
