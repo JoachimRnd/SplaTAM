@@ -6,6 +6,7 @@ channels:
   - conda-forge
   - defaults
 dependencies:
+  - protobuf=3.20
   - cuda-toolkit=11.8
   - python=3.9
   - faiss-gpu=1.6.5
@@ -28,4 +29,5 @@ dependencies:
     - open3d==0.18.0
     - torchmetrics
     - cyclonedds
+    - pytorch_msssim
     - git+https://github.com/JonathonLuiten/diff-gaussian-rasterization-w-depth.git@cb65e4b86bc3bd8ed42174b72a62e8d3a3a71110
