@@ -94,3 +94,34 @@ def keyframe_selection_overlap(gt_depth, w2c, intrinsics, keyframe_list, k, pixe
             np.array(selected_keyframe_list))[:k])
 
         return selected_keyframe_list
+    
+def keyframe_selection_pose_based(w2c, keyframe_list, k):
+    """
+    Select keyframes based on pose similarity to the current camera observation
+
+    Args:
+        w2c (tensor): world to camera matrix (4 x 4) of the current frame.
+        keyframe_list (list): a list containing info for each keyframe.
+        k (int): number of keyframes to select.
+    Returns:
+        selected_keyframe_list (list): list of selected keyframe indices.
+    """
+    current_camera_position = torch.inverse(w2c)[:3, 3]
+
+    list_keyframe = []
+    for keyframeid, keyframe in enumerate(keyframe_list):
+        # Get the estimated camera position of the keyframe
+        keyframe_w2c = keyframe['est_w2c']
+        keyframe_camera_position = torch.inverse(keyframe_w2c)[:3, 3]
+
+        # Compute the Euclidean distance between the current frame and keyframe
+        distance = torch.norm(current_camera_position - keyframe_camera_position)
+        list_keyframe.append({'id': keyframeid, 'distance': distance.item()})
+
+    # Sort the keyframes based on distance
+    list_keyframe = sorted(list_keyframe, key=lambda i: i['distance'])
+
+    # Select the closest k keyframes
+    selected_keyframe_list = [keyframe_dict['id'] for keyframe_dict in list_keyframe[:k]]
+
+    return selected_keyframe_list

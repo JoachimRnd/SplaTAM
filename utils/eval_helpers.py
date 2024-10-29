@@ -6,6 +6,10 @@ from tqdm import tqdm
 import numpy as np
 import matplotlib.pyplot as plt
 
+from evo.core import metrics, trajectory
+from evo.tools import transformations
+from evo.core.trajectory import PosePath3D
+from evo.core.metrics import PoseRelation, RMSE
 from datasets.gradslam_datasets.geometryutils import relative_transformation
 from utils.recon_helpers import setup_camera
 from utils.slam_external import build_rotation, calc_psnr
@@ -76,6 +80,43 @@ def evaluate_ate(gt_traj, est_traj):
 
     return avg_trans_error
 
+def evaluate_ate_using_evo(gt_traj_list, est_traj_list, monocular=False):
+    """
+    Evaluate ATE using evo.
+
+    Args:
+        gt_traj_list: list of 4x4 ground truth poses
+        est_traj_list: list of 4x4 estimated poses 
+        monocular: bool, whether to perform scale correction when in mono mode
+    """
+
+    # Convert list of poses to arrays of positions and orientations
+    gt_positions = []
+    gt_orientations = []
+    est_positions = []
+    est_orientations = []
+    for gt_pose, est_pose in zip(gt_traj_list, est_traj_list):
+        gt_positions.append(gt_pose[:3, 3])
+        gt_orientations.append(transformations.quaternion_from_matrix(gt_pose))
+        est_positions.append(est_pose[:3, 3])
+        est_orientations.append(transformations.quaternion_from_matrix(est_pose))
+
+    gt_traj = PosePath3D(positions_xyz=np.array(gt_positions),
+                         orientations_quat_wxyz=np.array(gt_orientations))
+    est_traj = PosePath3D(positions_xyz=np.array(est_positions),
+                          orientations_quat_wxyz=np.array(est_orientations))
+
+    # Align the estimated trajectory to the ground truth
+    est_traj_aligned = trajectory.align_trajectory(est_traj, gt_traj, correct_scale=monocular)
+
+    # Compute ATE RMSE
+    data = (gt_traj, est_traj_aligned)
+    pose_relation = PoseRelation.translation_part
+    metric = metrics.APE(pose_relation)
+    metric.process_data(data)
+    ate_rmse = metric.get_statistic(metrics.StatisticsType.rmse)
+
+    return ate_rmse
 
 def report_loss(losses, wandb_run, wandb_step, tracking=False, mapping=False):
     # Update loss dict
@@ -151,7 +192,7 @@ def plot_rgbd_silhouette(color, depth, rastered_color, rastered_depth, presence_
 
 def report_progress(params, data, i, progress_bar, iter_time_idx, sil_thres, every_i=1, qual_every_i=1, 
                     tracking=False, mapping=False, wandb_run=None, wandb_step=None, wandb_save_qual=False, online_time_idx=None,
-                    global_logging=True):
+                    global_logging=True, monocular=False):
     if i % every_i == 0 or i == 1:
         if wandb_run is not None:
             if tracking:
@@ -200,7 +241,8 @@ def report_progress(params, data, i, progress_bar, iter_time_idx, sil_thres, eve
                 rel_pt_error = torch.zeros(1).float()
             
             # Calculate ATE RMSE
-            ate_rmse = evaluate_ate(gt_w2c_list, latest_est_w2c_list)
+            # ate_rmse = evaluate_ate(gt_w2c_list, latest_est_w2c_list) 
+            ate_rmse = evaluate_ate_using_evo(gt_w2c_list, latest_est_w2c_list, monocular=monocular) # TODO check if this is correct
             ate_rmse = np.round(ate_rmse, decimals=6)
             if wandb_run is not None:
                 tracking_log = {f"{stage}/Latest Pose Error":iter_pt_error, 
@@ -406,7 +448,7 @@ def eval_online(dataset, all_params, num_frames, eval_online_dir, sil_thres,
 
 
 def eval(dataset, final_params, num_frames, eval_dir, sil_thres, 
-         mapping_iters, add_new_gaussians, wandb_run=None, wandb_save_qual=False, eval_every=1, save_frames=False):
+         mapping_iters, add_new_gaussians, wandb_run=None, wandb_save_qual=False, eval_every=1, save_frames=False, monocular=False):
     print("Evaluating Final Parameters ...")
     psnr_list = []
     rmse_list = []
@@ -565,7 +607,8 @@ def eval(dataset, final_params, num_frames, eval_dir, sil_thres,
             valid_gt_w2c_list.append(gt_w2c_list[idx])
         gt_w2c_list = valid_gt_w2c_list
         # Calculate ATE RMSE
-        ate_rmse = evaluate_ate(gt_w2c_list, latest_est_w2c_list)
+        # ate_rmse = evaluate_ate(gt_w2c_list, latest_est_w2c_list)
+        ate_rmse = evaluate_ate_using_evo(gt_w2c_list, latest_est_w2c_list, monocular=monocular) # TODO check if this is correct
         print("Final Average ATE RMSE: {:.2f} cm".format(ate_rmse*100))
         if wandb_run is not None:
             wandb_run.log({"Final Stats/Avg ATE RMSE": ate_rmse,

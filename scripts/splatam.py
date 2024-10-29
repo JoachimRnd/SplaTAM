@@ -22,16 +22,16 @@ import torch.nn.functional as F
 from tqdm import tqdm
 import wandb
 
-from datasets.gradslam_datasets import (load_dataset_config, ICLDataset, ReplicaDataset, ReplicaV2Dataset, AzureKinectDataset,
+from datasets.gradslam_datasets import (load_dataset_config, ICLDataset, ReplicaDataset, ReplicaV2Dataset, ReplicaMonocularDataset, AzureKinectDataset,
                                         ScannetDataset, Ai2thorDataset, Record3DDataset, RealsenseDataset, TUMDataset,
                                         ScannetPPDataset, NeRFCaptureDataset)
 from utils.common_utils import seed_everything, save_params_ckpt, save_params
 from utils.eval_helpers import report_loss, report_progress, eval
-from utils.keyframe_selection import keyframe_selection_overlap
+from utils.keyframe_selection import keyframe_selection_overlap, keyframe_selection_pose_based
 from utils.recon_helpers import setup_camera
 from utils.slam_helpers import (
     transformed_params2rendervar, transformed_params2depthplussilhouette,
-    transform_to_frame, l1_loss_v1, matrix_to_quaternion
+    transform_to_frame, l1_loss_v1, matrix_to_quaternion, get_median_depth
 )
 from utils.slam_external import calc_ssim, build_rotation, prune_gaussians, densify
 
@@ -43,6 +43,8 @@ def get_dataset(config_dict, basedir, sequence, **kwargs):
         return ICLDataset(config_dict, basedir, sequence, **kwargs)
     elif config_dict["dataset_name"].lower() in ["replica"]:
         return ReplicaDataset(config_dict, basedir, sequence, **kwargs)
+    elif config_dict["dataset_name"].lower() in ["replica_monocular"]:
+        return ReplicaMonocularDataset(config_dict, basedir, sequence, **kwargs)
     elif config_dict["dataset_name"].lower() in ["replicav2"]:
         return ReplicaV2Dataset(config_dict, basedir, sequence, **kwargs)
     elif config_dict["dataset_name"].lower() in ["azure", "azurekinect"]:
@@ -66,7 +68,7 @@ def get_dataset(config_dict, basedir, sequence, **kwargs):
 
 
 def get_pointcloud(color, depth, intrinsics, w2c, transform_pts=True, 
-                   mask=None, compute_mean_sq_dist=False, mean_sq_dist_method="projective"):
+                   mask=None, compute_mean_sq_dist=False, mean_sq_dist_method="projective", monocular=False):
     width, height = color.shape[2], color.shape[1]
     CX = intrinsics[0][2]
     CY = intrinsics[1][2]
@@ -96,9 +98,13 @@ def get_pointcloud(color, depth, intrinsics, w2c, transform_pts=True,
     # Compute mean squared distance for initializing the scale of the Gaussians
     if compute_mean_sq_dist:
         if mean_sq_dist_method == "projective":
-            # Projective Geometry (this is fast, farther -> larger radius)
-            scale_gaussian = depth_z / ((FX + FY)/2)
-            mean3_sq_dist = scale_gaussian**2
+            if monocular:
+                default_mean_sq_dist_value = 0.01 # TODO to try
+                mean3_sq_dist = torch.ones(depth_z.shape[0], device=depth_z.device) * default_mean_sq_dist_value
+            else:
+                # Projective Geometry (this is fast, farther -> larger radius)
+                scale_gaussian = depth_z / ((FX + FY)/2)
+                mean3_sq_dist = scale_gaussian**2
         else:
             raise ValueError(f"Unknown mean_sq_dist_method {mean_sq_dist_method}")
     
@@ -166,16 +172,58 @@ def initialize_optimizer(params, lrs_dict, tracking):
     else:
         return torch.optim.Adam(param_groups, lr=0.0, eps=1e-15)
 
+def get_monocular_depth(depth, color, opacity, valid_rgb_mask):
+    if depth is None:
+        # initialize depth with default value and noise
+        initial_depth_value = 2.0
+        depth_noise_std = 0.3
+        initial_depth = torch.ones_like(color[0:1, :, :]) * initial_depth_value
+        initial_depth += torch.randn_like(depth) * depth_noise_std
+    else:
+        depth = depth.detach().clone()
+        if opacity is not None:
+            opacity = opacity.detach()
+        valid_rgb = valid_rgb_mask
+
+        # Compute median depth and standard deviation
+        median_depth, std_depth, valid_mask = get_median_depth(
+            depth, opacity, mask=valid_rgb, return_std=True
+        )
+
+        # Identify invalid depth values
+        invalid_depth_mask = torch.logical_or(
+            depth > median_depth + std_depth, depth < median_depth - std_depth
+        )
+        invalid_depth_mask = torch.logical_or(
+            invalid_depth_mask, ~valid_mask
+        )
+
+        # Replace invalid depths with the median
+        depth[invalid_depth_mask] = median_depth
+
+        # Add noise to depth
+        initial_depth = depth + torch.randn_like(depth) * torch.where(
+            invalid_depth_mask, std_depth * 0.5, std_depth * 0.2
+        )
+        initial_depth[~valid_rgb] = 0  # Ignore invalid RGB pixels
+
+    return initial_depth
 
 def initialize_first_timestep(dataset, num_frames, scene_radius_depth_ratio, 
-                              mean_sq_dist_method, densify_dataset=None, gaussian_distribution=None):
+                              mean_sq_dist_method, densify_dataset=None, gaussian_distribution=None, monocular=False, rgb_boundary_threshold=0.01):
     # Get RGB-D Data & Camera Parameters
     color, depth, intrinsics, pose = dataset[0]
 
     # Process RGB-D Data
     color = color.permute(2, 0, 1) / 255 # (H, W, C) -> (C, H, W)
-    depth = depth.permute(2, 0, 1) # (H, W, C) -> (C, H, W)
     
+    if monocular:
+        opacity = None  # because first time step
+        valid_rgb_mask = (color.sum(dim=0) > rgb_boundary_threshold)[None] # TODO rgb_boundary_threshold in config ?
+        depth = get_monocular_depth(depth, color, opacity, valid_rgb_mask)
+    else:
+        depth = depth.permute(2, 0, 1)  # (H, W, C) -> (C, H, W)
+        
     # Process Camera Parameters
     intrinsics = intrinsics[:3, :3]
     w2c = torch.linalg.inv(pose)
@@ -187,7 +235,13 @@ def initialize_first_timestep(dataset, num_frames, scene_radius_depth_ratio,
         # Get Densification RGB-D Data & Camera Parameters
         color, depth, densify_intrinsics, _ = densify_dataset[0]
         color = color.permute(2, 0, 1) / 255 # (H, W, C) -> (C, H, W)
-        depth = depth.permute(2, 0, 1) # (H, W, C) -> (C, H, W)
+        
+        if monocular:
+            opacity = None
+            valid_rgb_mask = (color.sum(dim=0) > rgb_boundary_threshold)[None] # TODO rgb_boundary_threshold in config ?
+            depth = get_monocular_depth(depth, color, opacity, valid_rgb_mask)
+        else:
+            depth = depth.permute(2, 0, 1)  # (H, W, C) -> (C, H, W)
         densify_intrinsics = densify_intrinsics[:3, :3]
         densify_cam = setup_camera(color.shape[2], color.shape[1], densify_intrinsics.cpu().numpy(), w2c.detach().cpu().numpy())
     else:
@@ -198,7 +252,8 @@ def initialize_first_timestep(dataset, num_frames, scene_radius_depth_ratio,
     mask = mask.reshape(-1)
     init_pt_cld, mean3_sq_dist = get_pointcloud(color, depth, densify_intrinsics, w2c, 
                                                 mask=mask, compute_mean_sq_dist=True, 
-                                                mean_sq_dist_method=mean_sq_dist_method)
+                                                mean_sq_dist_method=mean_sq_dist_method,
+                                                monocular=monocular)
 
     # Initialize Parameters
     params, variables = initialize_params(init_pt_cld, num_frames, mean3_sq_dist, gaussian_distribution)
@@ -214,7 +269,7 @@ def initialize_first_timestep(dataset, num_frames, scene_radius_depth_ratio,
 
 def get_loss(params, curr_data, variables, iter_time_idx, loss_weights, use_sil_for_loss,
              sil_thres, use_l1, ignore_outlier_depth_loss, tracking=False, 
-             mapping=False, do_ba=False, plot_dir=None, visualize_tracking_loss=False, tracking_iteration=None):
+             mapping=False, do_ba=False, plot_dir=None, visualize_tracking_loss=False, tracking_iteration=None, monocular=False):
     # Initialize Loss Dictionary
     losses = {}
 
@@ -248,6 +303,7 @@ def get_loss(params, curr_data, variables, iter_time_idx, loss_weights, use_sil_
     # RGB Rendering
     rendervar['means2D'].retain_grad()
     im, radius, _, = Renderer(raster_settings=curr_data['cam'])(**rendervar)
+    opacity = im[3].unsqueeze(0)
     variables['means2D'] = rendervar['means2D']  # Gradient only accum from colour render for densification
 
     # Depth & Silhouette Rendering
@@ -261,19 +317,25 @@ def get_loss(params, curr_data, variables, iter_time_idx, loss_weights, use_sil_
 
     # Mask with valid depth values (accounts for outlier depth values)
     nan_mask = (~torch.isnan(depth)) & (~torch.isnan(uncertainty))
-    if ignore_outlier_depth_loss:
+    if ignore_outlier_depth_loss and not monocular:
         depth_error = torch.abs(curr_data['depth'] - depth) * (curr_data['depth'] > 0)
         mask = (depth_error < 10*depth_error.median())
-        mask = mask & (curr_data['depth'] > 0)
+        mask = mask & (curr_data['depth'] > 0) & nan_mask
     else:
-        mask = (curr_data['depth'] > 0)
-    mask = mask & nan_mask
+        if monocular:
+            rgb_pixel_mask = (curr_data['im'].sum(dim=0) > 0.01)[None] # TODO rgb_boundary_threshold in config ?
+            mask = rgb_pixel_mask & nan_mask # TODO or & nan_mask
+        else:
+            mask = (curr_data['depth'] > 0) & nan_mask
+            
     # Mask with presence silhouette mask (accounts for empty space)
     if tracking and use_sil_for_loss:
         mask = mask & presence_sil_mask
 
     # Depth loss
-    if use_l1:
+    if monocular:
+        losses['depth'] = torch.tensor(0.0, device=depth.device) # TODO shape
+    elif use_l1:
         mask = mask.detach()
         if tracking:
             losses['depth'] = torch.abs(curr_data['depth'] - depth)[mask].sum()
@@ -284,11 +346,31 @@ def get_loss(params, curr_data, variables, iter_time_idx, loss_weights, use_sil_
     if tracking and (use_sil_for_loss or ignore_outlier_depth_loss):
         color_mask = torch.tile(mask, (3, 1, 1))
         color_mask = color_mask.detach()
-        losses['im'] = torch.abs(curr_data['im'] - im)[color_mask].sum()
+        if monocular:
+            diff = torch.abs(curr_data['im'] - im) * opacity
+        else:
+            diff = torch.abs(curr_data['im'] - im)
+        losses['im'] = diff[color_mask].sum()
     elif tracking:
-        losses['im'] = torch.abs(curr_data['im'] - im).sum()
-    else:
-        losses['im'] = 0.8 * l1_loss_v1(im, curr_data['im']) + 0.2 * (1.0 - calc_ssim(im, curr_data['im']))
+        if monocular:
+            diff = torch.abs(curr_data['im'] - im) * opacity
+        else:
+            diff = torch.abs(curr_data['im'] - im)
+        losses['im'] = diff.sum()
+    else: # mapping l1 loss & ssim loss
+        # TODO check if mapping loss needs to be weighted
+        # if monocular:
+        #     diff = torch.abs(curr_data['im'] - im)
+        #     diff = diff * opacity * color_mask
+        #     l1 = diff.mean()
+        #     ssim = (1.0 - calc_ssim(im * color_mask, curr_data['im'] * color_mask))
+        # 2nd version
+        # l1 = l1_loss_v1(im * opacity, curr_data['im'] * opacity)
+        # ssim = (1.0 - calc_ssim(im * opacity, curr_data['im'] * opacity))
+        # else:
+        l1 = l1_loss_v1(im, curr_data['im'])
+        ssim = (1.0 - calc_ssim(im, curr_data['im']))
+        losses['im'] = 0.8 * l1 + 0.2 * ssim
 
     # Visualize the Diff Images
     if tracking and visualize_tracking_loss:
@@ -377,7 +459,7 @@ def initialize_new_params(new_pt_cld, mean3_sq_dist, gaussian_distribution):
 
 
 def add_new_gaussians(params, variables, curr_data, sil_thres, 
-                      time_idx, mean_sq_dist_method, gaussian_distribution):
+                      time_idx, mean_sq_dist_method, gaussian_distribution, monocular=False, rgb_boundary_threshold=0.01):
     # Silhouette Rendering
     transformed_gaussians = transform_to_frame(params, time_idx, gaussians_grad=False, camera_grad=False)
     depth_sil_rendervar = transformed_params2depthplussilhouette(params, curr_data['w2c'],
@@ -385,15 +467,16 @@ def add_new_gaussians(params, variables, curr_data, sil_thres,
     depth_sil, _, _, = Renderer(raster_settings=curr_data['cam'])(**depth_sil_rendervar)
     silhouette = depth_sil[1, :, :]
     non_presence_sil_mask = (silhouette < sil_thres)
-    # Check for new foreground objects by using GT depth
-    gt_depth = curr_data['depth'][0, :, :]
-    render_depth = depth_sil[0, :, :]
-    depth_error = torch.abs(gt_depth - render_depth) * (gt_depth > 0)
-    non_presence_depth_mask = (render_depth > gt_depth) * (depth_error > 50*depth_error.median())
-    # Determine non-presence mask
-    non_presence_mask = non_presence_sil_mask | non_presence_depth_mask
-    # Flatten mask
-    non_presence_mask = non_presence_mask.reshape(-1)
+    non_presence_mask = non_presence_sil_mask.reshape(-1)
+
+    if not monocular:
+        # Check for new foreground objects by using GT depth
+        gt_depth = curr_data['depth'][0, :, :]
+        render_depth = depth_sil[0, :, :]
+        depth_error = torch.abs(gt_depth - render_depth) * (gt_depth > 0)
+        non_presence_depth_mask = (render_depth > gt_depth) * (depth_error > 50*depth_error.median())
+        # Determine non-presence mask
+        non_presence_mask = non_presence_mask | non_presence_depth_mask.reshape(-1)
 
     # Get the new frame Gaussians based on the Silhouette
     if torch.sum(non_presence_mask) > 0:
@@ -403,11 +486,29 @@ def add_new_gaussians(params, variables, curr_data, sil_thres,
         curr_w2c = torch.eye(4).cuda().float()
         curr_w2c[:3, :3] = build_rotation(curr_cam_rot)
         curr_w2c[:3, 3] = curr_cam_tran
-        valid_depth_mask = (curr_data['depth'][0, :, :] > 0)
-        non_presence_mask = non_presence_mask & valid_depth_mask.reshape(-1)
-        new_pt_cld, mean3_sq_dist = get_pointcloud(curr_data['im'], curr_data['depth'], curr_data['intrinsics'], 
-                                    curr_w2c, mask=non_presence_mask, compute_mean_sq_dist=True,
-                                    mean_sq_dist_method=mean_sq_dist_method)
+
+        if monocular:
+            # get opacity from rendering
+            rendervar = transformed_params2rendervar(params, transformed_gaussians) 
+            render_output, _, _, = Renderer(raster_settings=curr_data['cam'])(**rendervar) # TODO check if its optimal to render again
+            
+            opacity = render_output[3].unsqueeze(0)
+            depth = depth_sil[0, :, :].unsqueeze(0) # TODO
+            valid_rgb_mask = (curr_data['im'].sum(dim=0) > rgb_boundary_threshold)[None]
+
+            curr_depth = get_monocular_depth(depth, curr_data['im'], opacity, valid_rgb_mask)
+        else:
+            valid_depth_mask = (curr_data['depth'][0, :, :] > 0)
+            non_presence_mask = non_presence_mask & valid_depth_mask.reshape(-1)
+            curr_depth = curr_data['depth']
+
+        # Get point cloud from current image and (synthetic or real) depth
+        new_pt_cld, mean3_sq_dist = get_pointcloud(
+            curr_data['im'], curr_depth, curr_data['intrinsics'], curr_w2c,
+            mask=non_presence_mask, compute_mean_sq_dist=True,
+            mean_sq_dist_method=mean_sq_dist_method, monocular=monocular
+        )
+
         new_params = initialize_new_params(new_pt_cld, mean3_sq_dist, gaussian_distribution)
         for k, v in new_params.items():
             params[k] = torch.nn.Parameter(torch.cat((params[k], v), dim=0).requires_grad_(True))
@@ -531,6 +632,10 @@ def rgbd_slam(config: dict):
         ignore_bad=dataset_config["ignore_bad"],
         use_train_split=dataset_config["use_train_split"],
     )
+    _, depth_paths, _, _ = dataset[0]
+    if config.get('sensor_type', 'rgbd') == 'monocular' and depth_paths is not None:
+        raise ValueError("Depth paths should be None for monocular configuration.")
+    
     num_frames = dataset_config["num_frames"]
     if num_frames == -1:
         num_frames = len(dataset)
@@ -557,13 +662,15 @@ def rgbd_slam(config: dict):
                                                                         config['scene_radius_depth_ratio'],
                                                                         config['mean_sq_dist_method'],
                                                                         densify_dataset=densify_dataset,
-                                                                        gaussian_distribution=config['gaussian_distribution'])                                                                                                                  
+                                                                        gaussian_distribution=config['gaussian_distribution'],
+                                                                        monocular=config.get('sensor_type', 'rgbd') == 'monocular')                                                                                                                  
     else:
         # Initialize Parameters & Canoncial Camera parameters
         params, variables, intrinsics, first_frame_w2c, cam = initialize_first_timestep(dataset, num_frames, 
                                                                                         config['scene_radius_depth_ratio'],
                                                                                         config['mean_sq_dist_method'],
-                                                                                        gaussian_distribution=config['gaussian_distribution'])
+                                                                                        gaussian_distribution=config['gaussian_distribution'],
+                                                                                        monocular=config.get('sensor_type', 'rgbd') == 'monocular')
     
     # Init seperate dataloader for tracking if required
     if seperate_tracking_res:
@@ -648,7 +755,12 @@ def rgbd_slam(config: dict):
         gt_w2c = torch.linalg.inv(gt_pose)
         # Process RGB-D Data
         color = color.permute(2, 0, 1) / 255
-        depth = depth.permute(2, 0, 1)
+        
+        if config.get('sensor_type', 'rgbd') == 'monocular':
+            depth = get_monocular_depth(depth, color, None, None)
+        else:
+            depth = depth.permute(2, 0, 1)
+            
         gt_w2c_all_frames.append(gt_w2c)
         curr_gt_w2c = gt_w2c_all_frames
         # Optimize only current time step for tracking
@@ -695,7 +807,7 @@ def rgbd_slam(config: dict):
                                                    config['tracking']['use_sil_for_loss'], config['tracking']['sil_thres'],
                                                    config['tracking']['use_l1'], config['tracking']['ignore_outlier_depth_loss'], tracking=True, 
                                                    plot_dir=eval_dir, visualize_tracking_loss=config['tracking']['visualize_tracking_loss'],
-                                                   tracking_iteration=iter)
+                                                   tracking_iteration=iter, monocular=config.get('sensor_type', 'rgbd') == 'monocular')
                 if config['use_wandb']:
                     # Report Loss
                     wandb_tracking_step = report_loss(losses, wandb_run, wandb_tracking_step, tracking=True)
@@ -726,6 +838,7 @@ def rgbd_slam(config: dict):
                 # Check if we should stop tracking
                 iter += 1
                 if iter == num_iters_tracking:
+                    # TODO check with monocular mode
                     if losses['depth'] < config['tracking']['depth_loss_thres'] and config['tracking']['use_depth_loss_thres']:
                         break
                     elif config['tracking']['use_depth_loss_thres'] and not do_continue_slam:
@@ -792,7 +905,8 @@ def rgbd_slam(config: dict):
                 # Add new Gaussians to the scene based on the Silhouette
                 params, variables = add_new_gaussians(params, variables, densify_curr_data, 
                                                       config['mapping']['sil_thres'], time_idx,
-                                                      config['mean_sq_dist_method'], config['gaussian_distribution'])
+                                                      config['mean_sq_dist_method'], config['gaussian_distribution'],
+                                                      monocular=config.get('sensor_type', 'rgbd') == 'monocular')
                 post_num_pts = params['means3D'].shape[0]
                 if config['use_wandb']:
                     wandb_run.log({"Mapping/Number of Gaussians": post_num_pts,
@@ -807,7 +921,10 @@ def rgbd_slam(config: dict):
                 curr_w2c[:3, 3] = curr_cam_tran
                 # Select Keyframes for Mapping
                 num_keyframes = config['mapping_window_size']-2
-                selected_keyframes = keyframe_selection_overlap(depth, curr_w2c, intrinsics, keyframe_list[:-1], num_keyframes)
+                if config.get('sensor_type', 'rgbd') == 'monocular':
+                    selected_keyframes = keyframe_selection_pose_based(curr_w2c, keyframe_list[:-1], num_keyframes)
+                else:
+                    selected_keyframes = keyframe_selection_overlap(depth, curr_w2c, intrinsics, keyframe_list[:-1], num_keyframes)
                 selected_time_idx = [keyframe_list[frame_idx]['id'] for frame_idx in selected_keyframes]
                 if len(keyframe_list) > 0:
                     # Add last keyframe to the selected keyframes
@@ -847,7 +964,8 @@ def rgbd_slam(config: dict):
                 # Loss for current frame
                 loss, variables, losses = get_loss(params, iter_data, variables, iter_time_idx, config['mapping']['loss_weights'],
                                                 config['mapping']['use_sil_for_loss'], config['mapping']['sil_thres'],
-                                                config['mapping']['use_l1'], config['mapping']['ignore_outlier_depth_loss'], mapping=True)
+                                                config['mapping']['use_l1'], config['mapping']['ignore_outlier_depth_loss'], 
+                                                mapping=True, monocular=config.get('sensor_type', 'rgbd') == 'monocular')
                 if config['use_wandb']:
                     # Report Loss
                     wandb_mapping_step = report_loss(losses, wandb_run, wandb_mapping_step, mapping=True)
@@ -965,11 +1083,11 @@ def rgbd_slam(config: dict):
             eval(dataset, params, num_frames, eval_dir, sil_thres=config['mapping']['sil_thres'],
                  wandb_run=wandb_run, wandb_save_qual=config['wandb']['eval_save_qual'],
                  mapping_iters=config['mapping']['num_iters'], add_new_gaussians=config['mapping']['add_new_gaussians'],
-                 eval_every=config['eval_every'])
+                 eval_every=config['eval_every'], monocular=config.get('sensor_type', 'rgbd') == 'monocular')
         else:
             eval(dataset, params, num_frames, eval_dir, sil_thres=config['mapping']['sil_thres'],
                  mapping_iters=config['mapping']['num_iters'], add_new_gaussians=config['mapping']['add_new_gaussians'],
-                 eval_every=config['eval_every'])
+                 eval_every=config['eval_every'], monocular=config.get('sensor_type', 'rgbd') == 'monocular')
 
     # Add Camera Parameters to Save them
     params['timestep'] = variables['timestep']

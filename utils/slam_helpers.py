@@ -302,3 +302,18 @@ def transform_to_frame(params, time_idx, gaussians_grad, camera_grad):
         transformed_gaussians['unnorm_rotations'] = unnorm_rots
 
     return transformed_gaussians
+
+def get_median_depth(depth, opacity, mask=None, return_std=False):
+    depth = depth.detach().clone()
+    valid = depth > 0
+    if opacity is not None:
+        opacity = opacity.detach()
+        valid = torch.logical_and(valid, opacity > 0.95)
+    if mask is not None:
+        valid = torch.logical_and(valid, mask)
+    valid_depth = depth[valid]
+    
+    if return_std:
+        return valid_depth.median(), valid_depth.std(), valid
+    
+    return valid_depth.median()

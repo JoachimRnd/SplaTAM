@@ -3,7 +3,7 @@ from .basedataset import GradSLAMDataset
 from .dataconfig import load_dataset_config
 from .datautils import *
 from .icl import ICLDataset
-from .replica import ReplicaDataset, ReplicaV2Dataset
+from .replica import ReplicaDataset, ReplicaV2Dataset, ReplicaMonocularDataset
 from .scannet import ScannetDataset
 from .ai2thor import Ai2thorDataset
 from .realsense import RealsenseDataset
