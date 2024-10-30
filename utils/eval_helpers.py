@@ -6,10 +6,9 @@ from tqdm import tqdm
 import numpy as np
 import matplotlib.pyplot as plt
 
-from evo.core import metrics, trajectory
-from evo.tools import transformations
+from evo.core import metrics, trajectory, transformations
 from evo.core.trajectory import PosePath3D
-from evo.core.metrics import PoseRelation, RMSE
+from evo.core.metrics import PoseRelation
 from datasets.gradslam_datasets.geometryutils import relative_transformation
 from utils.recon_helpers import setup_camera
 from utils.slam_external import build_rotation, calc_psnr
