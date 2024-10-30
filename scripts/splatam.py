@@ -302,12 +302,11 @@ def get_loss(params, curr_data, variables, iter_time_idx, loss_weights, use_sil_
 
     # RGB Rendering
     rendervar['means2D'].retain_grad()
-    im, radius, _, = Renderer(raster_settings=curr_data['cam'])(**rendervar)
-    # opacity = im[3].unsqueeze(0)
+    im, radius, _, opacity, _ = Renderer(raster_settings=curr_data['cam'])(**rendervar)
     variables['means2D'] = rendervar['means2D']  # Gradient only accum from colour render for densification
 
     # Depth & Silhouette Rendering
-    depth_sil, _, _, = Renderer(raster_settings=curr_data['cam'])(**depth_sil_rendervar)
+    depth_sil, _, _, _, _ = Renderer(raster_settings=curr_data['cam'])(**depth_sil_rendervar)
     depth = depth_sil[0, :, :].unsqueeze(0)
     silhouette = depth_sil[1, :, :]
     presence_sil_mask = (silhouette > sil_thres)
@@ -347,13 +346,13 @@ def get_loss(params, curr_data, variables, iter_time_idx, loss_weights, use_sil_
         color_mask = torch.tile(mask, (3, 1, 1))
         color_mask = color_mask.detach()
         if monocular:
-            diff = torch.abs(curr_data['im'] - im) #* opacity
+            diff = torch.abs(curr_data['im'] - im) * opacity
         else:
             diff = torch.abs(curr_data['im'] - im)
         losses['im'] = diff[color_mask].sum()
     elif tracking:
         if monocular:
-            diff = torch.abs(curr_data['im'] - im) #* opacity
+            diff = torch.abs(curr_data['im'] - im) * opacity
         else:
             diff = torch.abs(curr_data['im'] - im)
         losses['im'] = diff.sum()
@@ -464,7 +463,7 @@ def add_new_gaussians(params, variables, curr_data, sil_thres,
     transformed_gaussians = transform_to_frame(params, time_idx, gaussians_grad=False, camera_grad=False)
     depth_sil_rendervar = transformed_params2depthplussilhouette(params, curr_data['w2c'],
                                                                  transformed_gaussians)
-    depth_sil, _, _, = Renderer(raster_settings=curr_data['cam'])(**depth_sil_rendervar)
+    depth_sil, _, _, _, _ = Renderer(raster_settings=curr_data['cam'])(**depth_sil_rendervar)
     silhouette = depth_sil[1, :, :]
     non_presence_sil_mask = (silhouette < sil_thres)
     non_presence_mask = non_presence_sil_mask.reshape(-1)
@@ -490,13 +489,12 @@ def add_new_gaussians(params, variables, curr_data, sil_thres,
         if monocular:
             # get opacity from rendering
             rendervar = transformed_params2rendervar(params, transformed_gaussians) 
-            render_output, _, _, = Renderer(raster_settings=curr_data['cam'])(**rendervar) # TODO check if its optimal to render again
+            _, _, _, opacity, _ = Renderer(raster_settings=curr_data['cam'])(**rendervar) # TODO check if its optimal to render again
             
-            #opacity = render_output[3].unsqueeze(0)
             depth = depth_sil[0, :, :].unsqueeze(0) # TODO
             valid_rgb_mask = (curr_data['im'].sum(dim=0) > rgb_boundary_threshold)[None]
 
-            curr_depth = get_monocular_depth(depth, curr_data['im'], None, valid_rgb_mask)#opacity, valid_rgb_mask)
+            curr_depth = get_monocular_depth(depth, curr_data['im'], opacity, valid_rgb_mask)
         else:
             valid_depth_mask = (curr_data['depth'][0, :, :] > 0)
             non_presence_mask = non_presence_mask & valid_depth_mask.reshape(-1)
