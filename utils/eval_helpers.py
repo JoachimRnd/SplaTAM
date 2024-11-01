@@ -95,21 +95,29 @@ def evaluate_ate_using_evo(gt_traj_list, est_traj_list, monocular=False):
     est_positions = []
     est_orientations = []
     for gt_pose, est_pose in zip(gt_traj_list, est_traj_list):
-        gt_positions.append(gt_pose[:3, 3])
-        gt_orientations.append(transformations.quaternion_from_matrix(gt_pose))
-        est_positions.append(est_pose[:3, 3])
-        est_orientations.append(transformations.quaternion_from_matrix(est_pose))
+        gt_pose_np = gt_pose.detach().cpu().numpy()
+        est_pose_np = est_pose.detach().cpu().numpy()
 
-    gt_traj = PosePath3D(positions_xyz=np.array(gt_positions),
-                         orientations_quat_wxyz=np.array(gt_orientations))
-    est_traj = PosePath3D(positions_xyz=np.array(est_positions),
-                          orientations_quat_wxyz=np.array(est_orientations))
+        gt_positions.append(gt_pose_np[:3, 3])
+        gt_orientations.append(transformations.quaternion_from_matrix(gt_pose_np))
+        est_positions.append(est_pose_np[:3, 3])
+        est_orientations.append(transformations.quaternion_from_matrix(est_pose_np))
+
+    gt_positions = np.array(gt_positions)
+    gt_orientations = np.array(gt_orientations)
+    est_positions = np.array(est_positions)
+    est_orientations = np.array(est_orientations)
+
+    gt_traj = PosePath3D(positions_xyz=gt_positions,
+                         orientations_quat_wxyz=gt_orientations)
+    est_traj = PosePath3D(positions_xyz=est_positions,
+                          orientations_quat_wxyz=est_orientations)
 
     # Align the estimated trajectory to the ground truth
-    est_traj_aligned = trajectory.align_trajectory(est_traj, gt_traj, correct_scale=monocular)
-
+    est_traj.align(gt_traj, correct_scale=monocular)
+    
     # Compute ATE RMSE
-    data = (gt_traj, est_traj_aligned)
+    data = (gt_traj, est_traj)
     pose_relation = PoseRelation.translation_part
     metric = metrics.APE(pose_relation)
     metric.process_data(data)
