@@ -1,13 +1,6 @@
 import os
 from os.path import join as p_join
 
-sensor_type = "monocular"
-
-loss_weights = dict(
-    im=1.0 if sensor_type == "monocular" else 0.5,
-    depth=0.0 if sensor_type == "monocular" else 1.0,
-)
-
 scenes = ["room0", "room1", "room2",
           "office0", "office1", "office2",
           "office_", "office4"]
@@ -26,6 +19,7 @@ group_name = "Replica"
 run_name = f"{scene_name}_{seed}_monocular"
 
 config = dict(
+    sensor_type = "monocular",
     workdir=f"./experiments/{group_name}",
     run_name=run_name,
     seed=seed,
@@ -71,7 +65,10 @@ config = dict(
         sil_thres=0.99,
         use_l1=True,
         ignore_outlier_depth_loss=False,
-        loss_weights=loss_weights,
+        loss_weights=dict(
+            im=1.0,
+            depth=0.0,
+        ),
         lrs=dict(
             means3D=0.0,
             rgb_colors=0.0,
@@ -89,7 +86,10 @@ config = dict(
         use_l1=True,
         use_sil_for_loss=False,
         ignore_outlier_depth_loss=False,
-        loss_weights=loss_weights,
+        loss_weights=dict(
+            im=1.0,
+            depth=0.0,
+        ),
         lrs=dict(
             means3D=0.0001,
             rgb_colors=0.0025,
