@@ -168,8 +168,9 @@ class GradSLAMDataset(torch.utils.data.Dataset):
             self.crop_edge = config_dict["camera_params"]["crop_edge"]
 
         self.color_paths, self.depth_paths, self.embedding_paths = self.get_filepaths()
-        if len(self.color_paths) != len(self.depth_paths):
-            raise ValueError("Number of color and depth images must be the same.")
+        
+        if config_dict["camera_params"].get('sensor_type', 'rgbd') != 'monocular' and len(self.color_paths) != len(self.depth_paths):
+          raise ValueError("Number of color and depth images must be the same.")
         if self.load_embeddings:
             if len(self.color_paths) != len(self.embedding_paths):
                 raise ValueError("Mismatch between number of color images and number of embedding files.")
@@ -180,7 +181,10 @@ class GradSLAMDataset(torch.utils.data.Dataset):
             self.end = self.num_imgs
 
         self.color_paths = self.color_paths[self.start : self.end : stride]
-        self.depth_paths = self.depth_paths[self.start : self.end : stride]
+        if self.depth_paths is not None: # Monocular case
+            self.depth_paths = self.depth_paths[self.start : self.end : stride]
+        else:
+            self.depth_paths = [None] * len(self.color_paths)
         if self.load_embeddings:
             self.embedding_paths = self.embedding_paths[self.start : self.end : stride]
         self.poses = self.poses[self.start : self.end : stride]
@@ -298,11 +302,19 @@ class GradSLAMDataset(torch.utils.data.Dataset):
         depth_path = self.depth_paths[index]
         color = np.asarray(imageio.imread(color_path), dtype=float)
         color = self._preprocess_color(color)
-        if ".png" in depth_path:
-            # depth_data = cv2.imread(depth_path, cv2.IMREAD_UNCHANGED)
-            depth = np.asarray(imageio.imread(depth_path), dtype=np.int64)
-        elif ".exr" in depth_path:
-            depth = readEXR_onlydepth(depth_path)
+        
+        if depth_path is not None:
+            if ".png" in depth_path:
+                # depth_data = cv2.imread(depth_path, cv2.IMREAD_UNCHANGED)
+                depth = np.asarray(imageio.imread(depth_path), dtype=np.int64)
+            elif ".exr" in depth_path:
+                depth = readEXR_onlydepth(depth_path)
+            else:
+                raise ValueError(f"Unsupported depth file format: {depth_path}")
+            depth = self._preprocess_depth(depth)
+            depth = torch.from_numpy(depth)
+        else:
+            depth = None
 
         K = as_intrinsics_matrix([self.fx, self.fy, self.cx, self.cy])
         if self.distortion is not None:
@@ -311,9 +323,6 @@ class GradSLAMDataset(torch.utils.data.Dataset):
 
         color = torch.from_numpy(color)
         K = torch.from_numpy(K)
-
-        depth = self._preprocess_depth(depth)
-        depth = torch.from_numpy(depth)
 
         K = datautils.scale_intrinsics(K, self.height_downsample_ratio, self.width_downsample_ratio)
         intrinsics = torch.eye(4).to(K)
@@ -325,7 +334,7 @@ class GradSLAMDataset(torch.utils.data.Dataset):
             embedding = self.read_embedding_from_file(self.embedding_paths[index])
             return (
                 color.to(self.device).type(self.dtype),
-                depth.to(self.device).type(self.dtype),
+                depth.to(self.device).type(self.dtype) if depth is not None else None,
                 intrinsics.to(self.device).type(self.dtype),
                 pose.to(self.device).type(self.dtype),
                 embedding.to(self.device),  # Allow embedding to be another dtype
@@ -334,7 +343,7 @@ class GradSLAMDataset(torch.utils.data.Dataset):
 
         return (
             color.to(self.device).type(self.dtype),
-            depth.to(self.device).type(self.dtype),
+            depth.to(self.device).type(self.dtype) if depth is not None else None,
             intrinsics.to(self.device).type(self.dtype),
             pose.to(self.device).type(self.dtype),
             # self.retained_inds[index].item(),

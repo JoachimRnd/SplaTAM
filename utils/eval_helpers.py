@@ -614,9 +614,11 @@ def eval(dataset, final_params, num_frames, eval_dir, sil_thres,
             valid_gt_w2c_list.append(gt_w2c_list[idx])
         gt_w2c_list = valid_gt_w2c_list
         # Calculate ATE RMSE
-        # ate_rmse = evaluate_ate(gt_w2c_list, latest_est_w2c_list)
+        ate_rmse_old = evaluate_ate(gt_w2c_list, latest_est_w2c_list)
         ate_rmse = evaluate_ate_using_evo(gt_w2c_list, latest_est_w2c_list, monocular=monocular) # TODO check if this is correct
         print("Final Average ATE RMSE: {:.2f} cm".format(ate_rmse*100))
+        print("Final Average ATE RMSE OLD to see differences: {:.2f} cm".format(ate_rmse_old*100))
+        
         if wandb_run is not None:
             wandb_run.log({"Final Stats/Avg ATE RMSE": ate_rmse,
                         "Final Stats/step": 1})
