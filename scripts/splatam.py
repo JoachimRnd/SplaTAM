@@ -178,7 +178,7 @@ def get_monocular_depth(depth, color, opacity, valid_rgb_mask):
         initial_depth_value = 2.0
         depth_noise_std = 0.3
         initial_depth = torch.ones_like(color[0:1, :, :]) * initial_depth_value
-        initial_depth += torch.randn_like(initial_depth) * depth_noise_std
+        initial_depth += torch.randn_like(depth) * depth_noise_std
     else:
         depth = depth.detach().clone()
         if opacity is not None:
