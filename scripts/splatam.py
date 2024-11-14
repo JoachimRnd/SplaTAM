@@ -37,6 +37,13 @@ from utils.slam_external import calc_ssim, build_rotation, prune_gaussians, dens
 
 from diff_gaussian_rasterization import GaussianRasterizer as Renderer
 
+time_transform_to_frame = 0.0
+time_transformed_params = 0.0
+time_rgb_rendering = 0.0
+time_depth_sil_rendering = 0.0
+time_mask_computation = 0.0
+time_end = 0.0
+
 
 def get_dataset(config_dict, basedir, sequence, **kwargs):
     if config_dict["dataset_name"].lower() in ["icl"]:
@@ -99,15 +106,27 @@ def get_pointcloud(color, depth, intrinsics, w2c, transform_pts=True,
     if compute_mean_sq_dist:
         if mean_sq_dist_method == "projective":
             if monocular:
-                default_mean_sq_dist_value = 0.01 # TODO to try
+                default_mean_sq_dist_value = 1e-05 # TODO to try
                 mean3_sq_dist = torch.ones(depth_z.shape[0], device=depth_z.device) * default_mean_sq_dist_value
+                
+                # fx_fy_avg = (FX + FY) / 2
+                # estimated_distance = 1.0 / fx_fy_avg  
+                # mean3_sq_dist = torch.ones(depth_z.shape[0], device=depth_z.device) * (estimated_distance ** 2)
+
+                print("\n=== mean3_sq_dist (monocular) ===")
             else:
                 # Projective Geometry (this is fast, farther -> larger radius)
                 scale_gaussian = depth_z / ((FX + FY)/2)
                 mean3_sq_dist = scale_gaussian**2
+                print("\n=== mean3_sq_dist (depth) ===")
         else:
             raise ValueError(f"Unknown mean_sq_dist_method {mean_sq_dist_method}")
     
+    print(f"Min: {mean3_sq_dist.min().item()}")
+    print(f"Max: {mean3_sq_dist.max().item()}")
+    print(f"Mean: {mean3_sq_dist.mean().item()}")
+    print(f"Std: {mean3_sq_dist.std().item()}")
+    print(f"Median: {mean3_sq_dist.median().item()}")
     # Colorize point cloud
     cols = torch.permute(color, (1, 2, 0)).reshape(-1, 3) # (C, H, W) -> (H, W, C) -> (H * W, C)
     point_cld = torch.cat((pts, cols), -1)
@@ -211,6 +230,7 @@ def get_monocular_depth(depth, color, opacity, valid_rgb_mask):
 
 def initialize_first_timestep(dataset, num_frames, scene_radius_depth_ratio, 
                               mean_sq_dist_method, densify_dataset=None, gaussian_distribution=None, monocular=False, rgb_boundary_threshold=0.01):
+    print("Initializing First Timestep ...")
     # Get RGB-D Data & Camera Parameters
     color, depth, intrinsics, pose = dataset[0]
 
@@ -247,6 +267,8 @@ def initialize_first_timestep(dataset, num_frames, scene_radius_depth_ratio,
     else:
         densify_intrinsics = intrinsics
 
+    print(f"GPU memory before init_pt_cld: {torch.cuda.memory_allocated() / (1024 ** 3):.3f} GB")
+
     # Get Initial Point Cloud (PyTorch CUDA Tensor)
     mask = (depth > 0) # Mask out invalid depth values
     mask = mask.reshape(-1)
@@ -255,11 +277,18 @@ def initialize_first_timestep(dataset, num_frames, scene_radius_depth_ratio,
                                                 mean_sq_dist_method=mean_sq_dist_method,
                                                 monocular=monocular)
 
+    print(f"Shape of init_pt_cld: {init_pt_cld.shape}")
+    print(f"GPU memory after init_pt_cld: {torch.cuda.memory_allocated() / (1024 ** 3):.3f} GB")
+    
     # Initialize Parameters
     params, variables = initialize_params(init_pt_cld, num_frames, mean3_sq_dist, gaussian_distribution)
 
     # Initialize an estimate of scene radius for Gaussian-Splatting Densification
     variables['scene_radius'] = torch.max(depth)/scene_radius_depth_ratio
+
+
+    print("Initialization Complete!")
+    print(torch.cuda.memory_summary())
 
     if densify_dataset is not None:
         return params, variables, intrinsics, w2c, cam, densify_intrinsics, densify_cam
@@ -267,45 +296,46 @@ def initialize_first_timestep(dataset, num_frames, scene_radius_depth_ratio,
         return params, variables, intrinsics, w2c, cam
 
 
-def get_loss(params, curr_data, variables, iter_time_idx, loss_weights, use_sil_for_loss,
+def get_loss(params, curr_data, variables, iter_time_idx, loss_weights, use_sil_for_loss, 
              sil_thres, use_l1, ignore_outlier_depth_loss, tracking=False, 
              mapping=False, do_ba=False, plot_dir=None, visualize_tracking_loss=False, tracking_iteration=None, monocular=False):
+    global time_transform_to_frame, time_transformed_params, time_rgb_rendering, time_depth_sil_rendering, time_mask_computation, time_end
     # Initialize Loss Dictionary
     losses = {}
 
+    start_time = time.time()
     if tracking:
-        # Get current frame Gaussians, where only the camera pose gets gradient
         transformed_gaussians = transform_to_frame(params, iter_time_idx, 
-                                             gaussians_grad=False,
-                                             camera_grad=True)
+                                                   gaussians_grad=False,
+                                                   camera_grad=True)
     elif mapping:
         if do_ba:
-            # Get current frame Gaussians, where both camera pose and Gaussians get gradient
             transformed_gaussians = transform_to_frame(params, iter_time_idx,
-                                                 gaussians_grad=True,
-                                                 camera_grad=True)
+                                                       gaussians_grad=True,
+                                                       camera_grad=True)
         else:
-            # Get current frame Gaussians, where only the Gaussians get gradient
             transformed_gaussians = transform_to_frame(params, iter_time_idx,
-                                                 gaussians_grad=True,
-                                                 camera_grad=False)
+                                                       gaussians_grad=True,
+                                                       camera_grad=False)
     else:
-        # Get current frame Gaussians, where only the Gaussians get gradient
         transformed_gaussians = transform_to_frame(params, iter_time_idx,
-                                             gaussians_grad=True,
-                                             camera_grad=False)
+                                                   gaussians_grad=True,
+                                                   camera_grad=False)
+    time_transform_to_frame += (time.time() - start_time) * 1000
 
-    # Initialize Render Variables
+    start_time = time.time()
     rendervar = transformed_params2rendervar(params, transformed_gaussians)
     depth_sil_rendervar = transformed_params2depthplussilhouette(params, curr_data['w2c'],
                                                                  transformed_gaussians)
+    time_transformed_params += (time.time() - start_time) * 1000
 
-    # RGB Rendering
+    start_time = time.time()
     rendervar['means2D'].retain_grad()
     im, radius, _, opacity, _ = Renderer(raster_settings=curr_data['cam'])(**rendervar)
-    variables['means2D'] = rendervar['means2D']  # Gradient only accum from colour render for densification
+    variables['means2D'] = rendervar['means2D']
+    time_rgb_rendering += (time.time() - start_time) * 1000  # ms
 
-    # Depth & Silhouette Rendering
+    start_time = time.time()
     depth_sil, _, _, _, _ = Renderer(raster_settings=curr_data['cam'])(**depth_sil_rendervar)
     depth = depth_sil[0, :, :].unsqueeze(0)
     silhouette = depth_sil[1, :, :]
@@ -313,24 +343,26 @@ def get_loss(params, curr_data, variables, iter_time_idx, loss_weights, use_sil_
     depth_sq = depth_sil[2, :, :].unsqueeze(0)
     uncertainty = depth_sq - depth**2
     uncertainty = uncertainty.detach()
+    time_depth_sil_rendering += (time.time() - start_time) * 1000  # ms
 
-    # Mask with valid depth values (accounts for outlier depth values)
+    start_time = time.time()
     nan_mask = (~torch.isnan(depth)) & (~torch.isnan(uncertainty))
     if ignore_outlier_depth_loss and not monocular:
         depth_error = torch.abs(curr_data['depth'] - depth) * (curr_data['depth'] > 0)
-        mask = (depth_error < 10*depth_error.median())
+        mask = (depth_error < 10 * depth_error.median())
         mask = mask & (curr_data['depth'] > 0) & nan_mask
     else:
         if monocular:
-            rgb_pixel_mask = (curr_data['im'].sum(dim=0) > 0.01)[None] # TODO rgb_boundary_threshold in config ?
-            mask = rgb_pixel_mask & nan_mask # TODO or & nan_mask
+            rgb_pixel_mask = (curr_data['im'].sum(dim=0) > 0.01)[None]
+            mask = rgb_pixel_mask & nan_mask
         else:
             mask = (curr_data['depth'] > 0) & nan_mask
             
-    # Mask with presence silhouette mask (accounts for empty space)
     if tracking and use_sil_for_loss:
         mask = mask & presence_sil_mask
+    time_mask_computation += (time.time() - start_time) * 1000  # ms
 
+    start_time = time.time()
     # Depth loss
     if monocular:
         losses['depth'] = torch.tensor(0.0, device=depth.device) # TODO shape
@@ -425,6 +457,7 @@ def get_loss(params, curr_data, variables, iter_time_idx, loss_weights, use_sil_
     variables['max_2D_radius'][seen] = torch.max(radius[seen], variables['max_2D_radius'][seen])
     variables['seen'] = seen
     weighted_losses['loss'] = loss
+    time_end += (time.time() - start_time) * 1000  # ms
 
     return loss, variables, weighted_losses
 
@@ -692,6 +725,12 @@ def rgbd_slam(config: dict):
         tracking_cam = setup_camera(tracking_color.shape[2], tracking_color.shape[1], 
                                     tracking_intrinsics.cpu().numpy(), first_frame_w2c.detach().cpu().numpy())
     
+    
+    print("Starting Tracking & Mapping ...")
+    print("Point on gpu ram before tracking: ")
+    print(torch.cuda.memory_summary())
+    
+    
     # Initialize list to keep track of Keyframes
     keyframe_list = []
     keyframe_time_indices = []
@@ -745,6 +784,10 @@ def rgbd_slam(config: dict):
     else:
         checkpoint_time_idx = 0
     
+    print("Before Iteration on Frames")
+    print("Point on gpu ram before iteration on frames: ")
+    print(torch.cuda.memory_summary())
+    
     # Iterate over Scan
     for time_idx in tqdm(range(checkpoint_time_idx, num_frames)):
         # Load RGBD frames incrementally instead of all frames
@@ -784,6 +827,10 @@ def rgbd_slam(config: dict):
         if time_idx > 0:
             params = initialize_camera_pose(params, time_idx, forward_prop=config['tracking']['forward_prop'])
 
+        
+        print("BEFORE IF")
+        print("time idx: ", time_idx)
+        print(torch.cuda.memory_summary())
         # Tracking
         tracking_start_time = time.time()
         if time_idx > 0 and not config['tracking']['use_gt_poses']:
@@ -798,6 +845,11 @@ def rgbd_slam(config: dict):
             do_continue_slam = False
             num_iters_tracking = config['tracking']['num_iters']
             progress_bar = tqdm(range(num_iters_tracking), desc=f"Tracking Time Step: {time_idx}")
+            
+            print("Before first Tracking Iteration")
+            print("Index",time_idx)
+            print(torch.cuda.memory_summary())
+
             while True:
                 iter_start_time = time.time()
                 # Loss for current frame
@@ -855,6 +907,10 @@ def rgbd_slam(config: dict):
                 params['cam_unnorm_rots'][..., time_idx] = candidate_cam_unnorm_rot
                 params['cam_trans'][..., time_idx] = candidate_cam_tran
         elif time_idx > 0 and config['tracking']['use_gt_poses']:
+            print("DANS LE ELIF DE TRACKING")
+            print("time idx: ", time_idx)
+            print(torch.cuda.memory_summary())
+
             with torch.no_grad():
                 # Get the ground truth pose relative to frame 0
                 rel_w2c = curr_gt_w2c[-1]
@@ -864,19 +920,34 @@ def rgbd_slam(config: dict):
                 # Update the camera parameters
                 params['cam_unnorm_rots'][..., time_idx] = rel_w2c_rot_quat
                 params['cam_trans'][..., time_idx] = rel_w2c_tran
+                
+        print("AFTER IF")
+        print("time idx: ", time_idx)
+        print(torch.cuda.memory_summary())        
+        
         # Update the runtime numbers
         tracking_end_time = time.time()
         tracking_frame_time_sum += tracking_end_time - tracking_start_time
         tracking_frame_time_count += 1
 
+        print("BEFORE PROGRESS")
+        print("time idx: ", time_idx)
+        print(torch.cuda.memory_summary())  
         if time_idx == 0 or (time_idx+1) % config['report_global_progress_every'] == 0:
             try:
                 # Report Final Tracking Progress
                 progress_bar = tqdm(range(1), desc=f"Tracking Result Time Step: {time_idx}")
                 with torch.no_grad():
                     if config['use_wandb']:
+                        print("BEFORE report PROGRESS")
+
+                        print(torch.cuda.memory_summary())  
+
                         report_progress(params, tracking_curr_data, 1, progress_bar, iter_time_idx, sil_thres=config['tracking']['sil_thres'], tracking=True,
                                         wandb_run=wandb_run, wandb_step=wandb_time_step, wandb_save_qual=config['wandb']['save_qual'], global_logging=True)
+                        print("AFTER report PROGRESS")
+
+                        print(torch.cuda.memory_summary())  
                     else:
                         report_progress(params, tracking_curr_data, 1, progress_bar, iter_time_idx, sil_thres=config['tracking']['sil_thres'], tracking=True)
                 progress_bar.close()
@@ -884,7 +955,10 @@ def rgbd_slam(config: dict):
                 ckpt_output_dir = os.path.join(config["workdir"], config["run_name"])
                 save_params_ckpt(params, ckpt_output_dir, time_idx)
                 print('Failed to evaluate trajectory.')
-
+        print("AFTER PROGRESS")
+        print("time idx: ", time_idx)
+        print(torch.cuda.memory_summary())  
+        
         # Densification & KeyFrame-based Mapping
         if time_idx == 0 or (time_idx+1) % config['map_every'] == 0:
             # Densification
@@ -900,16 +974,32 @@ def rgbd_slam(config: dict):
                 else:
                     densify_curr_data = curr_data
 
+                print("Before add new gaussians first")
+                print("Index",time_idx)
+                print(torch.cuda.memory_summary())
+                print(f"GPU memory before: {torch.cuda.memory_allocated() / (1024 ** 3):.3f} GB")
+
                 # Add new Gaussians to the scene based on the Silhouette
                 params, variables = add_new_gaussians(params, variables, densify_curr_data, 
                                                       config['mapping']['sil_thres'], time_idx,
                                                       config['mean_sq_dist_method'], config['gaussian_distribution'],
                                                       monocular=config.get('sensor_type', 'rgbd') == 'monocular')
+                
+                print(f"GPU memory after: {torch.cuda.memory_allocated() / (1024 ** 3):.3f} GB")
+                print("After add new gaussians first")
+                print("Index",time_idx)
+                print(torch.cuda.memory_summary())    
+            
                 post_num_pts = params['means3D'].shape[0]
                 if config['use_wandb']:
                     wandb_run.log({"Mapping/Number of Gaussians": post_num_pts,
                                    "Mapping/step": wandb_time_step})
             
+            
+            print("Before key frame selection")
+            print("Index",time_idx)
+            print(torch.cuda.memory_summary())
+            print(f"GPU memory before: {torch.cuda.memory_allocated() / (1024 ** 3):.3f} GB")
             with torch.no_grad():
                 # Get the current estimated rotation & translation
                 curr_cam_rot = F.normalize(params['cam_unnorm_rots'][..., time_idx].detach())
@@ -934,13 +1024,28 @@ def rgbd_slam(config: dict):
                 # Print the selected keyframes
                 print(f"\nSelected Keyframes at Frame {time_idx}: {selected_time_idx}")
 
+            
+            print("Before initialize optimizer")
+            print("Index",time_idx)
+            print(torch.cuda.memory_summary())
+            print(f"GPU memory before: {torch.cuda.memory_allocated() / (1024 ** 3):.3f} GB")
             # Reset Optimizer & Learning Rates for Full Map Optimization
             optimizer = initialize_optimizer(params, config['mapping']['lrs'], tracking=False) 
-
+            print("After initialize optimizer")
+            print("Index",time_idx)
+            print(torch.cuda.memory_summary())
+            print(f"GPU memory before: {torch.cuda.memory_allocated() / (1024 ** 3):.3f} GB")
+            
             # Mapping
             mapping_start_time = time.time()
             if num_iters_mapping > 0:
                 progress_bar = tqdm(range(num_iters_mapping), desc=f"Mapping Time Step: {time_idx}")
+                
+            total_time_get_loss = 0.0
+            total_time_backward = 0.0
+            total_time_pruning = 0.0
+            total_time_optimizer = 0.0
+            total_time_report = 0.0
             for iter in range(num_iters_mapping):
                 iter_start_time = time.time()
                 # Randomly select a frame until current time step amongst keyframes
@@ -960,19 +1065,35 @@ def rgbd_slam(config: dict):
                 iter_data = {'cam': cam, 'im': iter_color, 'depth': iter_depth, 'id': iter_time_idx, 
                              'intrinsics': intrinsics, 'w2c': first_frame_w2c, 'iter_gt_w2c_list': iter_gt_w2c}
                 # Loss for current frame
+                start_time_loss = time.time()
                 loss, variables, losses = get_loss(params, iter_data, variables, iter_time_idx, config['mapping']['loss_weights'],
                                                 config['mapping']['use_sil_for_loss'], config['mapping']['sil_thres'],
                                                 config['mapping']['use_l1'], config['mapping']['ignore_outlier_depth_loss'], 
                                                 mapping=True, monocular=config.get('sensor_type', 'rgbd') == 'monocular')
+                end_time_loss = time.time()
+                time_taken_for_loss = (end_time_loss - start_time_loss) * 1000
+                total_time_get_loss += time_taken_for_loss
+                # print(f"time taken for get_loss : {time_taken_for_loss:.4f} ms")
+
                 if config['use_wandb']:
                     # Report Loss
                     wandb_mapping_step = report_loss(losses, wandb_run, wandb_mapping_step, mapping=True)
                 # Backprop
+                start_time_backward = time.time()
                 loss.backward()
+                end_time_backward = time.time()
+                time_taken_for_backward = (end_time_backward - start_time_backward) * 1000
+                total_time_backward += time_taken_for_backward
+                # print(f"time taken for backward : {time_taken_for_backward:.4f} ms")
                 with torch.no_grad():
                     # Prune Gaussians
                     if config['mapping']['prune_gaussians']:
+                        start_time_pruning = time.time()
                         params, variables = prune_gaussians(params, variables, optimizer, iter, config['mapping']['pruning_dict'])
+                        end_time_pruning = time.time()
+                        time_taken_for_pruning = (end_time_pruning - start_time_pruning) * 1000
+                        total_time_pruning += time_taken_for_pruning
+                        #print(f"time taken for pruning : {time_taken_for_pruning:.4f} ms")
                         if config['use_wandb']:
                             wandb_run.log({"Mapping/Number of Gaussians - Pruning": params['means3D'].shape[0],
                                            "Mapping/step": wandb_mapping_step})
@@ -983,14 +1104,24 @@ def rgbd_slam(config: dict):
                             wandb_run.log({"Mapping/Number of Gaussians - Densification": params['means3D'].shape[0],
                                            "Mapping/step": wandb_mapping_step})
                     # Optimizer Update
+                    start_time_optimizer = time.time()
                     optimizer.step()
                     optimizer.zero_grad(set_to_none=True)
+                    end_time_optimizer = time.time()
+                    time_taken_for_optimizer = (end_time_optimizer - start_time_optimizer) * 1000
+                    total_time_optimizer += time_taken_for_optimizer
+                    # print(f"time taken for optimizer : {time_taken_for_optimizer:.4f} ms")
                     # Report Progress
                     if config['report_iter_progress']:
                         if config['use_wandb']:
+                            start_time_report = time.time()
                             report_progress(params, iter_data, iter+1, progress_bar, iter_time_idx, sil_thres=config['mapping']['sil_thres'], 
                                             wandb_run=wandb_run, wandb_step=wandb_mapping_step, wandb_save_qual=config['wandb']['save_qual'],
                                             mapping=True, online_time_idx=time_idx)
+                            end_time_report = time.time()
+                            time_taken_for_report = (end_time_report - start_time_report) * 1000
+                            total_time_report += time_taken_for_report
+                            # print(f"time taken for report : {time_taken_for_report:.4f} ms")
                         else:
                             report_progress(params, iter_data, iter+1, progress_bar, iter_time_idx, sil_thres=config['mapping']['sil_thres'], 
                                             mapping=True, online_time_idx=time_idx)
@@ -1000,8 +1131,34 @@ def rgbd_slam(config: dict):
                 iter_end_time = time.time()
                 mapping_iter_time_sum += iter_end_time - iter_start_time
                 mapping_iter_time_count += 1
+                
+            average_time_get_loss = total_time_get_loss / num_iters_mapping
+            # print(f"Mean time taken for get_loss on {num_iters_mapping} iterations : {average_time_get_loss:.4f} ms")
+            average_time_backward = total_time_backward / num_iters_mapping
+            # print(f"Mean time taken for backward on {num_iters_mapping} iterations : {average_time_backward:.4f} ms")
+            average_time_pruning = total_time_pruning / num_iters_mapping
+            # print(f"Mean time taken for pruning on {num_iters_mapping} iterations : {average_time_pruning:.4f} ms")
+            average_time_optimizer = total_time_optimizer / num_iters_mapping
+            # print(f"Mean time taken for optimizer on {num_iters_mapping} iterations : {average_time_optimizer:.4f} ms")
+            average_time_report = total_time_report / num_iters_mapping
+            # print(f"Mean time taken for report on {num_iters_mapping} iterations : {average_time_report:.4f} ms")
+            
+            
+            
+            
             if num_iters_mapping > 0:
                 progress_bar.close()
+                
+            print("Get loss")
+            print(f"Mean time transform_to_frame : {time_transform_to_frame / num_iters_mapping:.2f} ms")
+            print(f"Mean time transformed_params2rendervar & depth_sil_rendervar : {time_transformed_params / num_iters_mapping:.2f} ms")
+            print(f"Mean time RGB Rendering : {time_rgb_rendering / num_iters_mapping:.2f} ms")
+            print(f"Mean time Depth & Silhouette Rendering : {time_depth_sil_rendering / num_iters_mapping:.2f} ms")
+            print(f"Mean time mask computation : {time_mask_computation / num_iters_mapping:.2f} ms")
+            print(f"Mean time end get loss : {time_end / num_iters_mapping:.2f} ms")
+
+                
+                
             # Update the runtime numbers
             mapping_end_time = time.time()
             mapping_frame_time_sum += mapping_end_time - mapping_start_time

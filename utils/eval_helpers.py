@@ -89,33 +89,23 @@ def evaluate_ate_using_evo(gt_traj_list, est_traj_list, monocular=False):
         monocular: bool, whether to perform scale correction when in mono mode
     """
 
-    # Convert list of poses to arrays of positions and orientations
     gt_positions = []
-    gt_orientations = []
     est_positions = []
-    est_orientations = []
     for gt_pose, est_pose in zip(gt_traj_list, est_traj_list):
         gt_pose_np = gt_pose.detach().cpu().numpy()
         est_pose_np = est_pose.detach().cpu().numpy()
 
         gt_positions.append(gt_pose_np[:3, 3])
-        gt_orientations.append(transformations.quaternion_from_matrix(gt_pose_np))
         est_positions.append(est_pose_np[:3, 3])
-        est_orientations.append(transformations.quaternion_from_matrix(est_pose_np))
 
     gt_positions = np.array(gt_positions)
-    gt_orientations = np.array(gt_orientations)
     est_positions = np.array(est_positions)
-    est_orientations = np.array(est_orientations)
 
-    gt_traj = PosePath3D(positions_xyz=gt_positions,
-                         orientations_quat_wxyz=gt_orientations)
-    est_traj = PosePath3D(positions_xyz=est_positions,
-                          orientations_quat_wxyz=est_orientations)
+    gt_traj = PosePath3D(positions_xyz=gt_positions)
+    est_traj = PosePath3D(positions_xyz=est_positions)
 
     # Align the estimated trajectory to the ground truth
     est_traj.align(gt_traj, correct_scale=monocular)
-    
     # Compute ATE RMSE
     data = (gt_traj, est_traj)
     pose_relation = PoseRelation.translation_part
@@ -197,6 +187,15 @@ def plot_rgbd_silhouette(color, depth, rastered_color, rastered_depth, presence_
     plt.close()
 
 
+def print_tensor_stats(name, tensor):
+    print(f"--- {name} ---")
+    print(f"Min: {tensor.min().item()}")
+    print(f"Max: {tensor.max().item()}")
+    print(f"Mean: {tensor.mean().item()}")
+    print(f"Std: {tensor.std().item()}")
+    print(f"Median: {tensor.median().item()}")
+    print("")
+
 def report_progress(params, data, i, progress_bar, iter_time_idx, sil_thres, every_i=1, qual_every_i=1, 
                     tracking=False, mapping=False, wandb_run=None, wandb_step=None, wandb_save_qual=False, online_time_idx=None,
                     global_logging=True, monocular=False):
@@ -248,35 +247,112 @@ def report_progress(params, data, i, progress_bar, iter_time_idx, sil_thres, eve
                 rel_pt_error = torch.zeros(1).float()
             
             # Calculate ATE RMSE
-            # ate_rmse = evaluate_ate(gt_w2c_list, latest_est_w2c_list) 
-            ate_rmse = evaluate_ate_using_evo(gt_w2c_list, latest_est_w2c_list, monocular=monocular) # TODO check if this is correct
+            
+            # Covariance is degenerate at first timestep so Umeyama alignment is not possible
+            if iter_time_idx == 0:
+                ate_rmse = evaluate_ate(gt_w2c_list, latest_est_w2c_list) 
+            else:
+                ate_rmse = evaluate_ate_using_evo(gt_w2c_list, latest_est_w2c_list, monocular=monocular) # TODO check if this is correct
             ate_rmse = np.round(ate_rmse, decimals=6)
             if wandb_run is not None:
                 tracking_log = {f"{stage}/Latest Pose Error":iter_pt_error, 
                                f"{stage}/Latest Relative Pose Error":rel_pt_error,
                                f"{stage}/ATE RMSE":ate_rmse}
 
+        print("AFTER TRACKING EVAL")
+        print(torch.cuda.memory_summary())  
+
+
         # Get current frame Gaussians
         transformed_gaussians = transform_to_frame(params, iter_time_idx, 
                                                    gaussians_grad=False,
                                                    camera_grad=False)
-
+        print("AFTER TRANSFORM TO FRAME")
+        print(torch.cuda.memory_summary())  
+        
         # Initialize Render Variables
         rendervar = transformed_params2rendervar(params, transformed_gaussians)
         depth_sil_rendervar = transformed_params2depthplussilhouette(params, data['w2c'], 
                                                                      transformed_gaussians)
-        depth_sil, _, _, _, _ = Renderer(raster_settings=data['cam'])(**depth_sil_rendervar)
-        rastered_depth = depth_sil[0, :, :].unsqueeze(0)
-        valid_depth_mask = (data['depth'] > 0)
-        silhouette = depth_sil[1, :, :]
-        presence_sil_mask = (silhouette > sil_thres)
+        
+        print("AFTER TRANSFORMED PARAMS")
+        print(torch.cuda.memory_summary())  
+        
+        
+        print("=== rendervar shapes ===")
+        print(f"means3D shape: {rendervar['means3D'].shape}")
+        print(f"means2D shape: {rendervar['means2D'].shape}")
+        print(f"scales shape: {rendervar['scales'].shape}")
+        print(f"rotations shape: {rendervar['rotations'].shape}")
+        print(f"opacities shape: {rendervar['opacities'].shape}")
+        print(f"colors_precomp shape: {rendervar['colors_precomp'].shape}")
 
-        im, _, _, _, _ = Renderer(raster_settings=data['cam'])(**rendervar)
+        print("=== depth_sil_rendervar shapes ===")
+        print(f"means3D shape: {depth_sil_rendervar['means3D'].shape}")
+        print(f"means2D shape: {depth_sil_rendervar['means2D'].shape}")
+        print(f"scales shape: {depth_sil_rendervar['scales'].shape}")
+        print(f"rotations shape: {depth_sil_rendervar['rotations'].shape}")
+        print(f"opacities shape: {depth_sil_rendervar['opacities'].shape}")
+        print(f"colors_precomp shape: {depth_sil_rendervar['colors_precomp'].shape}")
+
+        print("=== rendervar stats ===")
+        for key, value in rendervar.items():
+            print_tensor_stats(key, value)
+
+        print("=== depth_sil_rendervar stats ===")
+        for key, value in depth_sil_rendervar.items():
+            print_tensor_stats(key, value)
+        
+        
+        print("=== Camera Configuration ===")
+        print(f"Resolution: {data['cam'].image_height} x {data['cam'].image_width}")
+        print(f"tanfovx: {data['cam'].tanfovx}, tanfovy: {data['cam'].tanfovy}")
+        print(f"Camera Position (campos): {data['cam'].campos}")
+        print(f"View Matrix (viewmatrix): {data['cam'].viewmatrix}")
+        print(f"Projection Matrix (projmatrix): {data['cam'].projmatrix}")
+        print(f"Projection Matrix (Raw): {data['cam'].projmatrix_raw}")
+        print(f"Scale Modifier: {data['cam'].scale_modifier}")
+        print(f"Prefiltered: {data['cam'].prefiltered}")
+        # print(f"Near: {near}, Far: {far}")
+
+
+        
+        
+        
+        #depth_sil, _, _, _, _ = Renderer(raster_settings=data['cam'])(**depth_sil_rendervar)
+        
+        with torch.autograd.profiler.profile(use_cuda=True) as prof:
+            depth_sil = Renderer(raster_settings=data['cam'])(**depth_sil_rendervar)[0]
+
+            rastered_depth = depth_sil[0, :, :].unsqueeze(0)
+            valid_depth_mask = (data['depth'] > 0)
+            silhouette = depth_sil[1, :, :]
+            presence_sil_mask = (silhouette > sil_thres)
+
+            
+            print("APRES FIRST RENDERING")
+            print(torch.cuda.memory_summary())  
+
+            print("rendervar:", rendervar)
+            print("depth_sil_rendervar:", depth_sil_rendervar)
+
+            
+            #im, _, _, _, _ = Renderer(raster_settings=data['cam'])(**rendervar)
+            im = Renderer(raster_settings=data['cam'])(**rendervar)[0]
+        
+        print(prof.key_averages().table(sort_by="cuda_memory_usage"))
+
         if tracking:
             psnr = calc_psnr(im * presence_sil_mask, data['im'] * presence_sil_mask).mean()
         else:
             psnr = calc_psnr(im, data['im']).mean()
 
+        print("AFTER SECOND RENDERING")
+        print(torch.cuda.memory_summary())      
+        torch.cuda.empty_cache()
+        print("AFTER cuda empty cache")
+        print(torch.cuda.memory_summary())      
+        
         if tracking:
             diff_depth_rmse = torch.sqrt((((rastered_depth - data['depth']) * presence_sil_mask) ** 2))
             diff_depth_rmse = diff_depth_rmse * valid_depth_mask

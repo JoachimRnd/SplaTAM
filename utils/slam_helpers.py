@@ -1,5 +1,6 @@
 import torch
 import torch.nn.functional as F
+import time
 from utils.slam_external import build_rotation
 
 def l1_loss_v1(x, y):
@@ -263,17 +264,29 @@ def transform_to_frame(params, time_idx, gaussians_grad, camera_grad):
         transformed_gaussians: Transformed Gaussians (dict containing means3D & unnorm_rotations)
     """
     # Get Frame Camera Pose
+    start_time = time.time()
     if camera_grad:
         cam_rot = F.normalize(params['cam_unnorm_rots'][..., time_idx])
         cam_tran = params['cam_trans'][..., time_idx]
     else:
         cam_rot = F.normalize(params['cam_unnorm_rots'][..., time_idx].detach())
         cam_tran = params['cam_trans'][..., time_idx].detach()
+    print("Time taken for NORMALIZE: ", (time.time() - start_time)*1000)
+    
+    print("Memory allocated before",torch.cuda.memory_summary())
+    start_time = time.time()
     rel_w2c = torch.eye(4).cuda().float()
-    rel_w2c[:3, :3] = build_rotation(cam_rot)
-    rel_w2c[:3, 3] = cam_tran
+    print("Time taken for getting camera pose with build rotation: ", (time.time() - start_time)*1000)
+    print("Memory allocated after",torch.cuda.memory_summary())
 
+    rel_w2c[:3, :3] = build_rotation(cam_rot)
+
+    rel_w2c[:3, 3] = cam_tran
     # Check if Gaussians need to be rotated (Isotropic or Anisotropic)
+    
+    start_time = time.time()
+    #print(params['log_scales'])
+    #print("gaussians shape   ->   ", params['log_scales'].shape[1])
     if params['log_scales'].shape[1] == 1:
         transform_rots = False # Isotropic Gaussians
     else:
@@ -300,7 +313,7 @@ def transform_to_frame(params, time_idx, gaussians_grad, camera_grad):
         transformed_gaussians['unnorm_rotations'] = transformed_rots
     else:
         transformed_gaussians['unnorm_rotations'] = unnorm_rots
-
+    print("Time taken for transforming Gaussians: ", (time.time() - start_time)*1000)
     return transformed_gaussians
 
 def get_median_depth(depth, opacity, mask=None, return_std=False):
