@@ -885,10 +885,11 @@ def rgbd_slam(config: dict):
                     else:
                         report_progress(params, tracking_curr_data, 1, progress_bar, iter_time_idx, sil_thres=config['tracking']['sil_thres'], tracking=True)
                 progress_bar.close()
-            except:
+            except Exception as e:
                 ckpt_output_dir = os.path.join(config["workdir"], config["run_name"])
                 save_params_ckpt(params, ckpt_output_dir, time_idx)
                 print('Failed to evaluate trajectory.')
+                print(e)
 
         # Densification & KeyFrame-based Mapping
         if time_idx == 0 or (time_idx+1) % config['map_every'] == 0:
@@ -1025,10 +1026,11 @@ def rgbd_slam(config: dict):
                             report_progress(params, curr_data, 1, progress_bar, time_idx, sil_thres=config['mapping']['sil_thres'], 
                                             mapping=True, online_time_idx=time_idx)
                     progress_bar.close()
-                except:
+                except Exception as e:
                     ckpt_output_dir = os.path.join(config["workdir"], config["run_name"])
                     save_params_ckpt(params, ckpt_output_dir, time_idx)
                     print('Failed to evaluate trajectory.')
+                    print(e)
         
         # Add frame to keyframe list
         if ((time_idx == 0) or ((time_idx+1) % config['keyframe_every'] == 0) or \

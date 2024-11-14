@@ -478,7 +478,8 @@ def eval(dataset, final_params, num_frames, eval_dir, sil_thres,
 
         # Process RGB-D Data
         color = color.permute(2, 0, 1) / 255 # (H, W, C) -> (C, H, W)
-        depth = depth.permute(2, 0, 1) # (H, W, C) -> (C, H, W)
+        if not monocular:
+            depth = depth.permute(2, 0, 1) # (H, W, C) -> (C, H, W)
 
         if time_idx == 0:
             # Process Camera Parameters
@@ -507,7 +508,10 @@ def eval(dataset, final_params, num_frames, eval_dir, sil_thres,
         depth_sil, _, _, _, _ = Renderer(raster_settings=curr_data['cam'])(**depth_sil_rendervar)
         rastered_depth = depth_sil[0, :, :].unsqueeze(0)
         # Mask invalid depth in GT
-        valid_depth_mask = (curr_data['depth'] > 0)
+        if monocular:
+            valid_depth_mask = torch.ones_like(color[0], dtype=torch.bool)
+        else:
+            valid_depth_mask = (curr_data['depth'] > 0)
         rastered_depth_viz = rastered_depth.detach()
         rastered_depth = rastered_depth * valid_depth_mask
         silhouette = depth_sil[1, :, :]
@@ -616,9 +620,10 @@ def eval(dataset, final_params, num_frames, eval_dir, sil_thres,
         if wandb_run is not None:
             wandb_run.log({"Final Stats/Avg ATE RMSE": ate_rmse,
                         "Final Stats/step": 1})
-    except:
+    except Exception as e:
         ate_rmse = 100.0
         print('Failed to evaluate trajectory with alignment.')
+        print(e)
     
     # Compute Average Metrics
     psnr_list = np.array(psnr_list)
