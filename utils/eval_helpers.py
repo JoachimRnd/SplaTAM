@@ -89,33 +89,23 @@ def evaluate_ate_using_evo(gt_traj_list, est_traj_list, monocular=False):
         monocular: bool, whether to perform scale correction when in mono mode
     """
 
-    # Convert list of poses to arrays of positions and orientations
     gt_positions = []
-    gt_orientations = []
     est_positions = []
-    est_orientations = []
     for gt_pose, est_pose in zip(gt_traj_list, est_traj_list):
         gt_pose_np = gt_pose.detach().cpu().numpy()
         est_pose_np = est_pose.detach().cpu().numpy()
 
         gt_positions.append(gt_pose_np[:3, 3])
-        gt_orientations.append(transformations.quaternion_from_matrix(gt_pose_np))
         est_positions.append(est_pose_np[:3, 3])
-        est_orientations.append(transformations.quaternion_from_matrix(est_pose_np))
 
     gt_positions = np.array(gt_positions)
-    gt_orientations = np.array(gt_orientations)
     est_positions = np.array(est_positions)
-    est_orientations = np.array(est_orientations)
 
-    gt_traj = PosePath3D(positions_xyz=gt_positions,
-                         orientations_quat_wxyz=gt_orientations)
-    est_traj = PosePath3D(positions_xyz=est_positions,
-                          orientations_quat_wxyz=est_orientations)
+    gt_traj = PosePath3D(positions_xyz=gt_positions)
+    est_traj = PosePath3D(positions_xyz=est_positions)
 
     # Align the estimated trajectory to the ground truth
     est_traj.align(gt_traj, correct_scale=monocular)
-    
     # Compute ATE RMSE
     data = (gt_traj, est_traj)
     pose_relation = PoseRelation.translation_part
@@ -248,8 +238,12 @@ def report_progress(params, data, i, progress_bar, iter_time_idx, sil_thres, eve
                 rel_pt_error = torch.zeros(1).float()
             
             # Calculate ATE RMSE
-            # ate_rmse = evaluate_ate(gt_w2c_list, latest_est_w2c_list) 
-            ate_rmse = evaluate_ate_using_evo(gt_w2c_list, latest_est_w2c_list, monocular=monocular) # TODO check if this is correct
+            # Covariance is degenerate at first timestep so Umeyama alignment is not possible
+            if iter_time_idx == 0:
+                ate_rmse = evaluate_ate(gt_w2c_list, latest_est_w2c_list) 
+            else:
+                ate_rmse = evaluate_ate_using_evo(gt_w2c_list, latest_est_w2c_list, monocular=monocular) # TODO check if this is correct
+                
             ate_rmse = np.round(ate_rmse, decimals=6)
             if wandb_run is not None:
                 tracking_log = {f"{stage}/Latest Pose Error":iter_pt_error, 

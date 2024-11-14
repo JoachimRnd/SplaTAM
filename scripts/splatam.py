@@ -99,8 +99,13 @@ def get_pointcloud(color, depth, intrinsics, w2c, transform_pts=True,
     if compute_mean_sq_dist:
         if mean_sq_dist_method == "projective":
             if monocular:
-                default_mean_sq_dist_value = 0.01 # TODO to try
+                
+                default_mean_sq_dist_value = 1e-05 # TODO to try
                 mean3_sq_dist = torch.ones(depth_z.shape[0], device=depth_z.device) * default_mean_sq_dist_value
+                
+                # fx_fy_avg = (FX + FY) / 2
+                # estimated_distance = 1.0 / fx_fy_avg  
+                # mean3_sq_dist = torch.ones(depth_z.shape[0], device=depth_z.device) * (estimated_distance ** 2)                  
             else:
                 # Projective Geometry (this is fast, farther -> larger radius)
                 scale_gaussian = depth_z / ((FX + FY)/2)
