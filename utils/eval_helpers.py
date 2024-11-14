@@ -95,14 +95,14 @@ def evaluate_ate_using_evo(gt_traj_list, est_traj_list, monocular=False):
         gt_pose_np = gt_pose.detach().cpu().numpy()
         est_pose_np = est_pose.detach().cpu().numpy()
 
-        gt_positions.append(gt_pose_np[:3, 3])
-        est_positions.append(est_pose_np[:3, 3])
+        gt_positions.append(gt_pose_np)
+        est_positions.append(est_pose_np)
 
     gt_positions = np.array(gt_positions)
     est_positions = np.array(est_positions)
 
-    gt_traj = PosePath3D(positions_xyz=gt_positions)
-    est_traj = PosePath3D(positions_xyz=est_positions)
+    gt_traj = PosePath3D(poses_se3=gt_positions)
+    est_traj = PosePath3D(poses_se3=est_positions)
 
     # Align the estimated trajectory to the ground truth
     est_traj.align(gt_traj, correct_scale=monocular)
@@ -535,23 +535,25 @@ def eval(dataset, final_params, num_frames, eval_dir, sil_thres,
         ssim_list.append(ssim.cpu().numpy())
         lpips_list.append(lpips_score)
 
-        # Compute Depth RMSE
-        if mapping_iters==0 and not add_new_gaussians:
-            diff_depth_rmse = torch.sqrt((((rastered_depth - curr_data['depth']) * presence_sil_mask) ** 2))
-            diff_depth_rmse = diff_depth_rmse * valid_depth_mask
-            rmse = diff_depth_rmse.sum() / valid_depth_mask.sum()
-            diff_depth_l1 = torch.abs((rastered_depth - curr_data['depth']) * presence_sil_mask)
-            diff_depth_l1 = diff_depth_l1 * valid_depth_mask
-            depth_l1 = diff_depth_l1.sum() / valid_depth_mask.sum()
-        else:
-            diff_depth_rmse = torch.sqrt((((rastered_depth - curr_data['depth'])) ** 2))
-            diff_depth_rmse = diff_depth_rmse * valid_depth_mask
-            rmse = diff_depth_rmse.sum() / valid_depth_mask.sum()
-            diff_depth_l1 = torch.abs((rastered_depth - curr_data['depth']))
-            diff_depth_l1 = diff_depth_l1 * valid_depth_mask
-            depth_l1 = diff_depth_l1.sum() / valid_depth_mask.sum()
-        rmse_list.append(rmse.cpu().numpy())
-        l1_list.append(depth_l1.cpu().numpy())
+
+        if not monocular:
+            # Compute Depth RMSE
+            if mapping_iters==0 and not add_new_gaussians:
+                diff_depth_rmse = torch.sqrt((((rastered_depth - curr_data['depth']) * presence_sil_mask) ** 2))
+                diff_depth_rmse = diff_depth_rmse * valid_depth_mask
+                rmse = diff_depth_rmse.sum() / valid_depth_mask.sum()
+                diff_depth_l1 = torch.abs((rastered_depth - curr_data['depth']) * presence_sil_mask)
+                diff_depth_l1 = diff_depth_l1 * valid_depth_mask
+                depth_l1 = diff_depth_l1.sum() / valid_depth_mask.sum()
+            else:
+                diff_depth_rmse = torch.sqrt((((rastered_depth - curr_data['depth'])) ** 2))
+                diff_depth_rmse = diff_depth_rmse * valid_depth_mask
+                rmse = diff_depth_rmse.sum() / valid_depth_mask.sum()
+                diff_depth_l1 = torch.abs((rastered_depth - curr_data['depth']))
+                diff_depth_l1 = diff_depth_l1 * valid_depth_mask
+                depth_l1 = diff_depth_l1.sum() / valid_depth_mask.sum()
+            rmse_list.append(rmse.cpu().numpy())
+            l1_list.append(depth_l1.cpu().numpy())
 
         if save_frames:
             # Save Rendered RGB and Depth
@@ -627,48 +629,59 @@ def eval(dataset, final_params, num_frames, eval_dir, sil_thres,
     
     # Compute Average Metrics
     psnr_list = np.array(psnr_list)
-    rmse_list = np.array(rmse_list)
-    l1_list = np.array(l1_list)
+    if not monocular:
+        rmse_list = np.array(rmse_list)
+        l1_list = np.array(l1_list)
+        avg_rmse = rmse_list.mean()
+        avg_l1 = l1_list.mean()
     ssim_list = np.array(ssim_list)
     lpips_list = np.array(lpips_list)
     avg_psnr = psnr_list.mean()
-    avg_rmse = rmse_list.mean()
-    avg_l1 = l1_list.mean()
     avg_ssim = ssim_list.mean()
     avg_lpips = lpips_list.mean()
     print("Average PSNR: {:.2f}".format(avg_psnr))
-    print("Average Depth RMSE: {:.2f} cm".format(avg_rmse*100))
-    print("Average Depth L1: {:.2f} cm".format(avg_l1*100))
+    if not monocular:
+        print("Average Depth RMSE: {:.2f} cm".format(avg_rmse*100))
+        print("Average Depth L1: {:.2f} cm".format(avg_l1*100))
     print("Average MS-SSIM: {:.3f}".format(avg_ssim))
     print("Average LPIPS: {:.3f}".format(avg_lpips))
 
     if wandb_run is not None:
-        wandb_run.log({"Final Stats/Average PSNR": avg_psnr, 
+        if not monocular:
+            wandb_run.log({"Final Stats/Average PSNR": avg_psnr, 
                        "Final Stats/Average Depth RMSE": avg_rmse,
                        "Final Stats/Average Depth L1": avg_l1,
                        "Final Stats/Average MS-SSIM": avg_ssim, 
                        "Final Stats/Average LPIPS": avg_lpips,
                        "Final Stats/step": 1})
+        else:
+            wandb_run.log({"Final Stats/Average PSNR": avg_psnr, 
+                           "Final Stats/Average MS-SSIM": avg_ssim, 
+                           "Final Stats/Average LPIPS": avg_lpips,
+                           "Final Stats/step": 1})
+        
 
     # Save metric lists as text files
     np.savetxt(os.path.join(eval_dir, "psnr.txt"), psnr_list)
-    np.savetxt(os.path.join(eval_dir, "rmse.txt"), rmse_list)
-    np.savetxt(os.path.join(eval_dir, "l1.txt"), l1_list)
+    if not monocular:
+        np.savetxt(os.path.join(eval_dir, "rmse.txt"), rmse_list)
+        np.savetxt(os.path.join(eval_dir, "l1.txt"), l1_list)
     np.savetxt(os.path.join(eval_dir, "ssim.txt"), ssim_list)
     np.savetxt(os.path.join(eval_dir, "lpips.txt"), lpips_list)
 
     # Plot PSNR & L1 as line plots
-    fig, axs = plt.subplots(1, 2, figsize=(12, 4))
-    axs[0].plot(np.arange(len(psnr_list)), psnr_list)
-    axs[0].set_title("RGB PSNR")
-    axs[0].set_xlabel("Time Step")
-    axs[0].set_ylabel("PSNR")
-    axs[1].plot(np.arange(len(l1_list)), l1_list*100)
-    axs[1].set_title("Depth L1")
-    axs[1].set_xlabel("Time Step")
-    axs[1].set_ylabel("L1 (cm)")
-    fig.suptitle("Average PSNR: {:.2f}, Average Depth L1: {:.2f} cm, ATE RMSE: {:.2f} cm".format(avg_psnr, avg_l1*100, ate_rmse*100), y=1.05, fontsize=16)
-    plt.savefig(os.path.join(eval_dir, "metrics.png"), bbox_inches='tight')
+    if not monocular:
+        fig, axs = plt.subplots(1, 2, figsize=(12, 4))
+        axs[0].plot(np.arange(len(psnr_list)), psnr_list)
+        axs[0].set_title("RGB PSNR")
+        axs[0].set_xlabel("Time Step")
+        axs[0].set_ylabel("PSNR")
+        axs[1].plot(np.arange(len(l1_list)), l1_list*100)
+        axs[1].set_title("Depth L1")
+        axs[1].set_xlabel("Time Step")
+        axs[1].set_ylabel("L1 (cm)")
+        fig.suptitle("Average PSNR: {:.2f}, Average Depth L1: {:.2f} cm, ATE RMSE: {:.2f} cm".format(avg_psnr, avg_l1*100, ate_rmse*100), y=1.05, fontsize=16)
+        plt.savefig(os.path.join(eval_dir, "metrics.png"), bbox_inches='tight')
     if wandb_run is not None:
         wandb_run.log({"Eval/Metrics": fig})
     plt.close()
