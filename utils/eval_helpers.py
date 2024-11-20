@@ -580,16 +580,18 @@ def eval(dataset, final_params, num_frames, eval_dir, sil_thres,
         fig_title = "Time Step: {}".format(time_idx)
         plot_name = "%04d" % time_idx
         presence_sil_mask = presence_sil_mask.detach().cpu().numpy()
-        if wandb_run is None:
-            plot_rgbd_silhouette(color, depth, im, rastered_depth_viz, presence_sil_mask, diff_depth_l1,
-                                 psnr, depth_l1, fig_title, plot_dir, 
-                                 plot_name=plot_name, save_plot=True)
-        elif wandb_save_qual:
-            plot_rgbd_silhouette(color, depth, im, rastered_depth_viz, presence_sil_mask, diff_depth_l1,
-                                 psnr, depth_l1, fig_title, plot_dir, 
-                                 plot_name=plot_name, save_plot=True,
-                                 wandb_run=wandb_run, wandb_step=None, 
-                                 wandb_title="Eval/Qual Viz")
+        
+        if not monocular:
+            if wandb_run is None:
+                plot_rgbd_silhouette(color, depth, im, rastered_depth_viz, presence_sil_mask, diff_depth_l1,
+                                    psnr, depth_l1, fig_title, plot_dir, 
+                                    plot_name=plot_name, save_plot=True)
+            elif wandb_save_qual:
+                plot_rgbd_silhouette(color, depth, im, rastered_depth_viz, presence_sil_mask, diff_depth_l1,
+                                    psnr, depth_l1, fig_title, plot_dir, 
+                                    plot_name=plot_name, save_plot=True,
+                                    wandb_run=wandb_run, wandb_step=None, 
+                                    wandb_title="Eval/Qual Viz")
 
     try:
         # Compute the final ATE RMSE
@@ -682,8 +684,8 @@ def eval(dataset, final_params, num_frames, eval_dir, sil_thres,
         axs[1].set_ylabel("L1 (cm)")
         fig.suptitle("Average PSNR: {:.2f}, Average Depth L1: {:.2f} cm, ATE RMSE: {:.2f} cm".format(avg_psnr, avg_l1*100, ate_rmse*100), y=1.05, fontsize=16)
         plt.savefig(os.path.join(eval_dir, "metrics.png"), bbox_inches='tight')
-    if wandb_run is not None:
-        wandb_run.log({"Eval/Metrics": fig})
+        if wandb_run is not None:
+            wandb_run.log({"Eval/Metrics": fig})
     plt.close()
 
 
