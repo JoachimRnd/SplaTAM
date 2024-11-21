@@ -113,6 +113,14 @@ def evaluate_ate_using_evo(gt_traj_list, est_traj_list, monocular=False):
     metric.process_data(data)
     ate_rmse = metric.get_statistic(metrics.StatisticsType.rmse)
 
+    if monocular:
+        est_traj_without_correct_scale = PosePath3D(poses_se3=est_positions)
+        est_traj_without_correct_scale.align(gt_traj, correct_scale=False)
+        data_without_correct_scale = (gt_traj, est_traj_without_correct_scale)
+        metric.process_data(data_without_correct_scale)
+        ate_rmse_without_correct_scale = metric.get_statistic(metrics.StatisticsType.rmse)
+        return ate_rmse, ate_rmse_without_correct_scale
+
     return ate_rmse
 
 def report_loss(losses, wandb_run, wandb_step, tracking=False, mapping=False):
@@ -618,7 +626,13 @@ def eval(dataset, final_params, num_frames, eval_dir, sil_thres,
         # Calculate ATE RMSE
         ate_rmse_old = evaluate_ate(gt_w2c_list, latest_est_w2c_list)
         ate_rmse = evaluate_ate_using_evo(gt_w2c_list, latest_est_w2c_list, monocular=monocular) # TODO check if this is correct
-        print("Final Average ATE RMSE: {:.2f} cm".format(ate_rmse*100))
+        if monocular:
+            ate_rmse, ate_rmse_without_correct_scale = evaluate_ate_using_evo(gt_w2c_list, latest_est_w2c_list, monocular=monocular)
+            print("Final Average ATE RMSE (with scale correction): {:.2f} cm".format(ate_rmse*100))
+            print("Final Average ATE RMSE (without scale correction): {:.2f} cm".format(ate_rmse_without_correct_scale*100))
+        else:
+            ate_rmse = evaluate_ate_using_evo(gt_w2c_list, latest_est_w2c_list, monocular=monocular)
+            print("Final Average ATE RMSE: {:.2f} cm".format(ate_rmse*100))
         print("Final Average ATE RMSE OLD to see differences: {:.2f} cm".format(ate_rmse_old*100))
         
         if wandb_run is not None:
