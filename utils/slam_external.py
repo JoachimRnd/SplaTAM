@@ -197,8 +197,8 @@ def prune_newly_inserted_gaussians_monocular(params, variables, optimizer, curre
 
     prune_coviz = 3
     n_gaussians = params['means3D'].shape[0]
-    n_obs = torch.zeros(n_gaussians, dtype=torch.long)
-
+    n_obs = torch.zeros(n_gaussians, dtype=torch.long, device='cuda')
+    
     for frame_idx in current_window:
         if frame_idx in variables['gaussian_visibility_per_frame']:
             visibility = variables['gaussian_visibility_per_frame'][frame_idx]

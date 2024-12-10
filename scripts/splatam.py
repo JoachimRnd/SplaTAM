@@ -534,6 +534,13 @@ def add_new_gaussians(params, variables, curr_data, sil_thres,
         )
         variables['kf_ids_gaussians_origin'] = torch.cat((variables['kf_ids_gaussians_origin'], new_kf_ids), dim=0)
         
+    new_gaussians_count = new_pt_cld.shape[0]
+
+    for f_idx in variables['gaussian_visibility_per_frame']:
+        old_vis = variables['gaussian_visibility_per_frame'][f_idx]
+        extension = torch.zeros(new_gaussians_count, dtype=old_vis.dtype, device=old_vis.device)
+        variables['gaussian_visibility_per_frame'][f_idx] = torch.cat([old_vis, extension], dim=0)
+    
     return params, variables
 
 
