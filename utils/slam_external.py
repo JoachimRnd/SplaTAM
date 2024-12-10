@@ -157,6 +157,10 @@ def remove_points(to_remove, params, variables, optimizer):
     variables['max_2D_radius'] = variables['max_2D_radius'][to_keep]
     if 'timestep' in variables.keys():
         variables['timestep'] = variables['timestep'][to_keep]
+    variables['kf_ids_gaussians_origin'] = variables['kf_ids_gaussians_origin'][to_keep]
+    for f_idx in list(variables['gaussian_visibility_per_frame'].keys()):
+        variables['gaussian_visibility_per_frame'][f_idx] = variables['gaussian_visibility_per_frame'][f_idx][to_keep]
+    
     return params, variables
 
 
@@ -187,6 +191,29 @@ def prune_gaussians(params, variables, optimizer, iter, prune_dict):
     
     return params, variables
 
+def prune_newly_inserted_gaussians_monocular(params, variables, optimizer, current_window):
+    if len(current_window) < 10: # TODO
+        return params, variables
+
+    prune_coviz = 3
+    n_gaussians = params['means3D'].shape[0]
+    n_obs = torch.zeros(n_gaussians, dtype=torch.long)
+
+    for frame_idx in current_window:
+        if frame_idx in variables['gaussian_visibility_per_frame']:
+            visibility = variables['gaussian_visibility_per_frame'][frame_idx]
+            n_obs += visibility.long()
+
+    sorted_window = sorted(current_window, reverse=True)
+    recent_threshold = sorted_window[2]
+    mask_recent = variables['kf_ids_gaussians_origin'] >= recent_threshold
+
+    to_prune = (n_obs <= prune_coviz) & mask_recent
+
+    if to_prune.any():
+        params, variables = remove_points(to_prune, params, variables, optimizer)
+
+    return params, variables
 
 def densify(params, variables, optimizer, iter, densify_dict):
     if iter <= densify_dict['stop_after']:

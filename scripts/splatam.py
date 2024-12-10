@@ -33,7 +33,7 @@ from utils.slam_helpers import (
     transformed_params2rendervar, transformed_params2depthplussilhouette,
     transform_to_frame, l1_loss_v1, matrix_to_quaternion, get_median_depth
 )
-from utils.slam_external import calc_ssim, build_rotation, prune_gaussians, densify
+from utils.slam_external import prune_newly_inserted_gaussians_monocular, calc_ssim, build_rotation, prune_gaussians, densify
 
 from diff_gaussian_rasterization import GaussianRasterizer as Renderer
 
@@ -164,7 +164,10 @@ def initialize_params(init_pt_cld, num_frames, mean3_sq_dist, gaussian_distribut
     variables = {'max_2D_radius': torch.zeros(params['means3D'].shape[0]).cuda().float(),
                  'means2D_gradient_accum': torch.zeros(params['means3D'].shape[0]).cuda().float(),
                  'denom': torch.zeros(params['means3D'].shape[0]).cuda().float(),
-                 'timestep': torch.zeros(params['means3D'].shape[0]).cuda().float()}
+                 'timestep': torch.zeros(params['means3D'].shape[0]).cuda().float(),
+                 'kf_ids_gaussians_origin': torch.zeros(params['means3D'].shape[0]).cuda().int(),
+                 'gaussian_visibility_per_frame': {}}
+    
 
     return params, variables
 
@@ -430,6 +433,7 @@ def get_loss(params, curr_data, variables, iter_time_idx, loss_weights, use_sil_
     variables['max_2D_radius'][seen] = torch.max(radius[seen], variables['max_2D_radius'][seen])
     variables['seen'] = seen
     weighted_losses['loss'] = loss
+    variables['gaussian_visibility_per_frame'][iter_time_idx] = seen.detach()
 
     return loss, variables, weighted_losses
 
@@ -522,6 +526,14 @@ def add_new_gaussians(params, variables, curr_data, sil_thres,
         new_timestep = time_idx*torch.ones(new_pt_cld.shape[0],device="cuda").float()
         variables['timestep'] = torch.cat((variables['timestep'],new_timestep),dim=0)
 
+        new_kf_ids = torch.full(
+            (new_pt_cld.shape[0],),
+            time_idx,
+            device='cuda',
+            dtype=torch.int
+        )
+        variables['kf_ids_gaussians_origin'] = torch.cat((variables['kf_ids_gaussians_origin'], new_kf_ids), dim=0)
+        
     return params, variables
 
 
@@ -1012,6 +1024,9 @@ def rgbd_slam(config: dict):
             mapping_end_time = time.time()
             mapping_frame_time_sum += mapping_end_time - mapping_start_time
             mapping_frame_time_count += 1
+
+        if config.get('sensor_type', 'rgbd') == 'monocular':
+            params, variables = prune_newly_inserted_gaussians_monocular(params, variables, optimizer, selected_time_idx)
 
             if time_idx == 0 or (time_idx+1) % config['report_global_progress_every'] == 0:
                 try:
