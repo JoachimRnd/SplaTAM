@@ -36,7 +36,7 @@ from utils.slam_helpers import (
 from utils.slam_external import prune_newly_inserted_gaussians_monocular, calc_ssim, build_rotation, prune_gaussians, densify
 
 from diff_gaussian_rasterization import GaussianRasterizer as Renderer
-
+from simple_knn._C import distCUDA2
 
 def get_dataset(config_dict, basedir, sequence, **kwargs):
     if config_dict["dataset_name"].lower() in ["icl"]:
@@ -95,27 +95,39 @@ def get_pointcloud(color, depth, intrinsics, w2c, transform_pts=True,
     else:
         pts = pts_cam
 
+    # Colorize point cloud
+    cols = torch.permute(color, (1, 2, 0)).reshape(-1, 3) # (C, H, W) -> (H, W, C) -> (H * W, C)
+    point_cld = torch.cat((pts, cols), -1)
+
     # Compute mean squared distance for initializing the scale of the Gaussians
     if compute_mean_sq_dist:
         if mean_sq_dist_method == "projective":
             if monocular:
+                # point_size = 0.05 # TODO in config
+                # adaptive_point_size = min(0.05, point_size * torch.median(depth))
+                
+                # temp = torch.clamp_min(distCUDA2(pts.float().contiguous()), 1e-7)
+
+                # # Compute distances
+                # dist2 = temp * adaptive_point_size
+                # mean3_sq_dist_temp = torch.abs(torch.log(torch.sqrt(dist2)))
+                # # Normalize to range [0, 1e-5]
+                # mean3_sq_dist = mean3_sq_dist_temp / mean3_sq_dist_temp.max() * 1e-5                
+
+                # print("mean3_sq_dist new:", mean3_sq_dist)
                 
                 default_mean_sq_dist_value = 1e-05 # TODO to try
                 mean3_sq_dist = torch.ones(depth_z.shape[0], device=depth_z.device) * default_mean_sq_dist_value
-                
-                # fx_fy_avg = (FX + FY) / 2
-                # estimated_distance = 1.0 / fx_fy_avg  
-                # mean3_sq_dist = torch.ones(depth_z.shape[0], device=depth_z.device) * (estimated_distance ** 2)                  
+                #print("mean3_sq_dist:", mean3_sq_dist)
+              
             else:
                 # Projective Geometry (this is fast, farther -> larger radius)
                 scale_gaussian = depth_z / ((FX + FY)/2)
                 mean3_sq_dist = scale_gaussian**2
+                # print("mean3_sq_dist:", mean3_sq_dist)
         else:
             raise ValueError(f"Unknown mean_sq_dist_method {mean_sq_dist_method}")
     
-    # Colorize point cloud
-    cols = torch.permute(color, (1, 2, 0)).reshape(-1, 3) # (C, H, W) -> (H, W, C) -> (H * W, C)
-    point_cld = torch.cat((pts, cols), -1)
 
     # Select points based on mask
     if mask is not None:
@@ -534,13 +546,14 @@ def add_new_gaussians(params, variables, curr_data, sil_thres,
         )
         variables['kf_ids_gaussians_origin'] = torch.cat((variables['kf_ids_gaussians_origin'], new_kf_ids), dim=0)
         
-    new_gaussians_count = new_pt_cld.shape[0]
+        new_gaussians_count = new_pt_cld.shape[0]
 
-    for f_idx in variables['gaussian_visibility_per_frame']:
-        old_vis = variables['gaussian_visibility_per_frame'][f_idx]
-        extension = torch.zeros(new_gaussians_count, dtype=old_vis.dtype, device=old_vis.device)
-        variables['gaussian_visibility_per_frame'][f_idx] = torch.cat([old_vis, extension], dim=0)
-    
+        for f_idx in variables['gaussian_visibility_per_frame']:
+            old_vis = variables['gaussian_visibility_per_frame'][f_idx]
+            extension = torch.zeros(new_gaussians_count, dtype=old_vis.dtype, device=old_vis.device)
+            variables['gaussian_visibility_per_frame'][f_idx] = torch.cat([old_vis, extension], dim=0)
+    else:
+        print("No new Gaussians added at kf number:", time_idx)
     return params, variables
 
 
@@ -930,10 +943,11 @@ def rgbd_slam(config: dict):
                                                       config['mapping']['sil_thres'], time_idx,
                                                       config['mean_sq_dist_method'], config['gaussian_distribution'],
                                                       monocular=config.get('sensor_type', 'rgbd') == 'monocular')
-                post_num_pts = params['means3D'].shape[0]
+                nbr_gaussians_before_pruning = params['means3D'].shape[0]
                 if config['use_wandb']:
-                    wandb_run.log({"Mapping/Number of Gaussians": post_num_pts,
+                    wandb_run.log({"Mapping/Number of Gaussians": nbr_gaussians_before_pruning,
                                    "Mapping/step": wandb_time_step})
+                
             
             with torch.no_grad():
                 # Get the current estimated rotation & translation
@@ -998,6 +1012,20 @@ def rgbd_slam(config: dict):
                     # Prune Gaussians
                     if config['mapping']['prune_gaussians']:
                         params, variables = prune_gaussians(params, variables, optimizer, iter, config['mapping']['pruning_dict'])
+                        
+                        nbr_gaussians_after_basic_pruning = params['means3D'].shape[0]
+                        nbr_basic_pruned_gaussians = nbr_gaussians_before_pruning - nbr_gaussians_after_basic_pruning
+                        if config['use_wandb']:
+                            wandb_run.log({"Number basic pruned gaussians": nbr_basic_pruned_gaussians,
+                                           "Mapping/step": wandb_mapping_step})
+                        
+                        if config.get('sensor_type', 'rgbd') == 'monocular':
+                            params, variables = prune_newly_inserted_gaussians_monocular(params, variables, optimizer, selected_time_idx)
+                            nbr_gaussians_after_monocular_pruning = params['means3D'].shape[0]
+                            nbr_monocular_pruned_gaussians = nbr_gaussians_before_pruning - nbr_gaussians_after_monocular_pruning
+                            if config['use_wandb']:
+                                wandb_run.log({"Number monocular pruned gaussians": nbr_monocular_pruned_gaussians,
+                                            "Mapping/step": wandb_mapping_step})
                         if config['use_wandb']:
                             wandb_run.log({"Mapping/Number of Gaussians - Pruning": params['means3D'].shape[0],
                                            "Mapping/step": wandb_mapping_step})
@@ -1031,9 +1059,6 @@ def rgbd_slam(config: dict):
             mapping_end_time = time.time()
             mapping_frame_time_sum += mapping_end_time - mapping_start_time
             mapping_frame_time_count += 1
-
-        if config.get('sensor_type', 'rgbd') == 'monocular':
-            params, variables = prune_newly_inserted_gaussians_monocular(params, variables, optimizer, selected_time_idx)
 
             if time_idx == 0 or (time_idx+1) % config['report_global_progress_every'] == 0:
                 try:

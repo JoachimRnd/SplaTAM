@@ -1,1 +1,2 @@
 git+https://github.com/JoachimRnd/diff-gaussian-rasterization-w-pose-median-depth.git@b823a1f4ea8b0c4bead59ea8ab977b2a22e3c210
+git+https://gitlab.inria.fr/bkerbl/simple-knn.git@86710c2d4b46680c02301765dd79e465819c8f19

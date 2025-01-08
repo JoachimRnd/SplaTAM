@@ -209,8 +209,28 @@ def prune_newly_inserted_gaussians_monocular(params, variables, optimizer, curre
     mask_recent = variables['kf_ids_gaussians_origin'] >= recent_threshold
 
     to_prune = (n_obs <= prune_coviz) & mask_recent
+    
+    # print("First 10 N_obs values (if present):")
+    # for i, obs in enumerate(n_obs[:10]):  # Slice the first 10 elements
+    #     print(f"Index {i}: {obs}")
 
+    # print("\nFirst 10 To_prune values (if present):")
+    # for i, prune in enumerate(to_prune[:10]):  # Slice the first 10 elements
+    #     print(f"Index {i}: {prune}")
+
+    # if len(n_obs) > 10:
+    #     print("\nLast 10 N_obs values (if present):")
+    #     for i, obs in enumerate(n_obs[-10:], start=len(n_obs) - 10):  # Slice the last 10 elements
+    #         print(f"Index {i}: {obs}")
+
+    # if len(to_prune) > 10:
+    #     print("\nLast 10 To_prune values (if present):")
+    #     for i, prune in enumerate(to_prune[-10:], start=len(to_prune) - 10):  # Slice the last 10 elements
+    #         print(f"Index {i}: {prune}")
+
+    
     if to_prune.any():
+        # print("Pruning Gaussians - Monocular")
         params, variables = remove_points(to_prune, params, variables, optimizer)
 
     return params, variables
