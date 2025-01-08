@@ -620,6 +620,7 @@ def rgbd_slam(config: dict):
     # Get Device
     device = torch.device(config["primary_device"])
 
+    nbr_gaussians_before_pruning = None
     # Load Dataset
     print("Loading Dataset ...")
     dataset_config = config["data"]
