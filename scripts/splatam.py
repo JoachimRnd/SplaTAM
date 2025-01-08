@@ -1011,6 +1011,9 @@ def rgbd_slam(config: dict):
                 with torch.no_grad():
                     # Prune Gaussians
                     if config['mapping']['prune_gaussians']:
+                        if nbr_gaussians_before_pruning is None:
+                            nbr_gaussians_before_pruning = params['means3D'].shape[0]
+
                         params, variables = prune_gaussians(params, variables, optimizer, iter, config['mapping']['pruning_dict'])
                         
                         nbr_gaussians_after_basic_pruning = params['means3D'].shape[0]
